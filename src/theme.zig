@@ -61,6 +61,46 @@ pub const gruvbox: Theme = .{
     .highlight = "\x1b[48;5;214m\x1b[38;5;232m",
 };
 
+pub const tokyonight: Theme = .{
+    .accent = "\x1b[38;5;111m",
+    .accent_strong = "\x1b[1;38;5;111m",
+    .dim = "\x1b[38;5;60m",
+    .ghost = "\x1b[38;5;238m",
+    .highlight = "\x1b[48;5;111m\x1b[38;5;235m",
+};
+
+pub const catppuccin: Theme = .{
+    .accent = "\x1b[38;5;183m",
+    .accent_strong = "\x1b[1;38;5;183m",
+    .dim = "\x1b[38;5;103m",
+    .ghost = "\x1b[38;5;240m",
+    .highlight = "\x1b[48;5;183m\x1b[38;5;235m",
+};
+
+pub const matrix: Theme = .{
+    .accent = "\x1b[38;5;46m",
+    .accent_strong = "\x1b[1;38;5;46m",
+    .dim = "\x1b[38;5;65m",
+    .ghost = "\x1b[38;5;22m",
+    .highlight = "\x1b[48;5;46m\x1b[38;5;232m",
+};
+
+pub const rosepine: Theme = .{
+    .accent = "\x1b[38;5;168m",
+    .accent_strong = "\x1b[1;38;5;168m",
+    .dim = "\x1b[38;5;245m",
+    .ghost = "\x1b[38;5;240m",
+    .highlight = "\x1b[48;5;168m\x1b[38;5;235m",
+};
+
+pub const solarized: Theme = .{
+    .accent = "\x1b[38;5;37m",
+    .accent_strong = "\x1b[1;38;5;136m",
+    .dim = "\x1b[38;5;66m",
+    .ghost = "\x1b[38;5;239m",
+    .highlight = "\x1b[48;5;37m\x1b[38;5;235m",
+};
+
 pub const default: Theme = red;
 
 pub const all = [_]Named{
@@ -70,6 +110,11 @@ pub const all = [_]Named{
     .{ .name = "dracula", .theme = dracula },
     .{ .name = "nord", .theme = nord },
     .{ .name = "gruvbox", .theme = gruvbox },
+    .{ .name = "tokyonight", .theme = tokyonight },
+    .{ .name = "catppuccin", .theme = catppuccin },
+    .{ .name = "matrix", .theme = matrix },
+    .{ .name = "rosepine", .theme = rosepine },
+    .{ .name = "solarized", .theme = solarized },
 };
 
 pub fn byName(name: []const u8) ?Theme {
@@ -106,10 +151,10 @@ test "byName resolves known names, aliases, and default" {
 test "indexOf matches all and only declared themes" {
     try testing.expectEqual(@as(?usize, 0), indexOf("red"));
     try testing.expectEqual(@as(?usize, 1), indexOf("cyan"));
-    try testing.expectEqual(@as(?usize, all.len - 1), indexOf("gruvbox"));
+    try testing.expectEqual(@as(?usize, all.len - 1), indexOf("solarized"));
     try testing.expect(indexOf("yt") == null); // alias is not a declared name
 }
 
 test "names is generated from the all table" {
-    try testing.expectEqualStrings("red, cyan, mono, dracula, nord, gruvbox", names);
+    try testing.expectEqualStrings("red, cyan, mono, dracula, nord, gruvbox, tokyonight, catppuccin, matrix, rosepine, solarized", names);
 }

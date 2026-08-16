@@ -4,6 +4,8 @@ const fsutil = @import("fsutil.zig");
 const c = @cImport({
     @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("stdio.h");
+    @cInclude("stdlib.h");
+    @cInclude("unistd.h");
 });
 
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
@@ -49,6 +51,32 @@ pub fn append(arena: std.mem.Allocator, file_path: []const u8, query: []const u8
     if (c.fwrite("\n", 1, 1, f) != 1) return error.WriteFailed;
 }
 
+pub fn remove(arena: std.mem.Allocator, file_path: []const u8, query: []const u8) !void {
+    const bytes = fsutil.readFileAlloc(arena, file_path) orelse return error.NotFound;
+
+    var kept: std.ArrayList([]const u8) = .empty;
+    var dropped = false;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (std.mem.eql(u8, trimmed, query)) {
+            dropped = true;
+            continue;
+        }
+        try kept.append(arena, trimmed);
+    }
+    if (!dropped) return error.NotFound;
+
+    const path_z = try arena.dupeZ(u8, file_path);
+    const f = c.fopen(path_z.ptr, "wb") orelse return error.OpenFailed;
+    defer _ = c.fclose(f);
+    for (kept.items) |line| {
+        const out = try std.fmt.allocPrint(arena, "{s}\n", .{line});
+        if (c.fwrite(out.ptr, 1, out.len, f) != out.len) return error.WriteFailed;
+    }
+}
+
 pub fn match(arena: std.mem.Allocator, items: []const []const u8, prefix: []const u8, max: usize) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (items) |s| {
@@ -81,6 +109,27 @@ test "match filters by case-insensitive prefix and honors max" {
 
     const none = try match(a, &items, "zz", 10);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "remove drops one entry and keeps the rest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try a.dupeZ(u8, "/tmp/ytcli_hist_XXXXXX");
+    const fd = c.mkstemp(p.ptr);
+    try testing.expect(fd >= 0);
+    _ = c.close(fd);
+    defer _ = c.unlink(p.ptr);
+
+    for ([_][]const u8{ "ado", "hong ting", "nina simone" }) |q| try append(a, p, q);
+    try remove(a, p, "hong ting");
+
+    const left = try load(a, p);
+    try testing.expectEqual(@as(usize, 2), left.len);
+    try testing.expectEqualStrings("nina simone", left[0]);
+    try testing.expectEqualStrings("ado", left[1]);
+    try testing.expectError(error.NotFound, remove(a, p, "hong ting"));
 }
 
 test "load returns empty for a missing file" {
