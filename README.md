@@ -18,20 +18,31 @@ zig 0.16, single binary
 - astats lavfi filter for visualizer via `ffmpeg`
 
 ## version
-<b>v0.1.4</b>
-+ `m` mute toggle (now-playing meter reads `mute`, visualizer idles while muted)
-+ `Ctrl+R` repeat mode: off → track → queue (autoplay loops per mode)
-+ volume persists across sessions (saved to config alongside theme)
-+ tracks over an hour render `h:mm:ss`
+<b>v0.1.5</b>
+- **playlists**: build as you browse: `P` saves the selected result, `Ctrl+A` saves whatever is playing; create a new list or add to an existing list
+- your playlists sit above recent searches on the search screen
+- `Ctrl+X` twice deletes the selected playlist *or* forgets the selected past search; `d`/`Ctrl+X` removes a track from an open playlist
+- `ytcli playlists [name]` prints them for piping
+- CJK/emoji titles no longer break the layout
+- long queries scroll with the cursor instead of vanishing off the edge
+- 5 new themes (tokyonight, catppuccin, matrix, rosepine, solarized)
+- frames drawn inside synchronized output — no tearing on theme switch
+- recoverable failures land in log and status bar instead of dropping you out
 <details>
 <summary>previous</summary><br>
 
+<b>v0.1.4</b><br>
+- `m` mute toggle (now-playing meter reads `mute`, visualizer idles while muted)<br>
+- `Ctrl+R` repeat mode: off → track → queue (autoplay loops per mode)<br>
+- volume persists across sessions (saved to config alongside theme)<br>
+- tracks over an hour render `h:mm:ss`
+
 <b>v0.1.3</b><br>
-+ selecting a track stops audio immediately + shows `connecting to YouTube…` in the now-playing footer<br>
-+ fix album view mislabeling tracks with a related artist (reads album header, not first channel link)<br>
-+ fix freeBSD release build (zig 0.16 translate-c: headers pulling `<sys/time.h>`, and `__ssp` fortify wrappers → `std.c` + `_FORTIFY_SOURCE=0`)<br>
-+ macOS release is now one universal binary (arm64 + x86_64), cross-built + `lipo`'d on a single runner — no more scarce Intel-runner queue<br>
-+ release CI `timeout-minutes` (fail fast instead of 24h runner-await hangs)
+- selecting a track stops audio immediately + shows `connecting to YouTube…` in the now-playing footer<br>
+- fix album view mislabeling tracks with a related artist (reads album header, not first channel link)<br>
+- fix freeBSD release build (zig 0.16 translate-c: headers pulling `<sys/time.h>`, and `__ssp` fortify wrappers → `std.c` + `_FORTIFY_SOURCE=0`)<br>
+- macOS release is now one universal binary (arm64 + x86_64), cross-built + `lipo`'d on a single runner<br>
+- release CI `timeout-minutes`
 
 <b>v0.1.2</b><br>
 + failures log to `~/.local/share/ytcli/log` (timestamp + cause)<br>
@@ -77,7 +88,9 @@ ytcli               # TUI
 ytcli <query>       # play first hit
 ytcli -s <query>    # search, print results
 ytcli history       # past queries
+ytcli playlists     # saved playlists (add a name to print its tracks)
 ytcli --theme cyan  # red (default) | cyan | mono | dracula | nord | gruvbox
+                    # tokyonight | catppuccin | matrix | rosepine | solarized
 ytcli --themes      # list themes
 ytcli -h | -v
 ```
@@ -89,10 +102,11 @@ made an effort to use commands that felt intuitive
 <details>
 <summary>view</summary><br>
 
-**typing:**<br>
-- text to query `↑/↓`
-- pick suggestion `tab`/`→`
-- accept completion `⏎` search
+**search screen:** (your playlists, then recent searches — one list)
+- text to query, `↑/↓` move
+- `⏎` opens the selected playlist, or searches the selected/typed query
+- `tab`/`→` accept completion (or open the selected playlist)
+- `Ctrl+X` twice — deletes the selected playlist, or forgets the selected past search
 - `esc` clear
 - `Ctrl+T` cycle filter (all/songs/videos/albums/artists)
 
@@ -101,6 +115,13 @@ made an effort to use commands that felt intuitive
  - `g/G` top/end
  - `Ctrl+F/B` page
  -  `h`/`esc` back
+ - `P` save to a playlist — never starts playback (pick one, or type a name for a new one)
+
+**inside a playlist:**
+- `⏎`/`l` play, queueing the rest of the list
+- `d` or `Ctrl+X` remove the selected track
+- `P` copy it into another playlist
+- `Ctrl+A` saves whatever is playing, from any screen
 
 **playback/anytime:**
 - `Ctrl+P`/`space` pause
@@ -117,6 +138,7 @@ made an effort to use commands that felt intuitive
 ## storage/config
 - `$XDG_DATA_HOME/ytcli/history` - query log (falls back to `~/.local/share/ytcli/history`).
 - `$XDG_DATA_HOME/ytcli/log` - timestamped failures (search/album/stream) with the underlying error and any `curl`/`yt-dlp` stderr. check here first when something says `(see log)`.
+- `$XDG_DATA_HOME/ytcli/playlists` - saved playlists: `[name]` header, then one `video_id⇥title⇥artist⇥kind` line per track. tab-separated, editable by hand.
 - `$XDG_CONFIG_HOME/ytcli/config` - `key=value` settings.
 
 history is just newline-delimited text - `grep`/`cat` it, or seed it so the TUI autocompletes your favorites from the first keystroke:

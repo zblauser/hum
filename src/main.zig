@@ -4,6 +4,7 @@ const stream = @import("stream.zig");
 const player = @import("player.zig");
 const ui = @import("ui.zig");
 const history = @import("history.zig");
+const playlist = @import("playlist.zig");
 const theme_mod = @import("theme.zig");
 const config = @import("config.zig");
 const log = @import("log.zig");
@@ -80,6 +81,10 @@ pub fn main(init: std.process.Init) !void {
         try cmdHistory(arena, init.environ_map);
         return;
     }
+    if (eq(first, "playlists")) {
+        try cmdPlaylists(arena, init.environ_map, if (args.items.len > 2) args.items[2] else null);
+        return;
+    }
     if (eq(first, "-s") or eq(first, "--search")) {
         if (args.items.len < 3) {
             try printHelp();
@@ -128,6 +133,7 @@ fn printHelp() !void {
         \\  ytcli <query>            play first hit for <query>
         \\  ytcli -s <query>         print top results, no playback
         \\  ytcli history            print recent queries (newest first)
+        \\  ytcli playlists [name]   list saved playlists, or one playlist's tracks
         \\  ytcli -h, --help         this message
         \\  ytcli -v, --version      print version
         \\
@@ -171,6 +177,30 @@ fn cmdSearch(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, words
         const line = try std.fmt.bufPrint(&buf, "{d:2}. {s} — {s}  [{s}]\n", .{ i + 1, t.title, t.artist, t.video_id });
         try putStdout(line);
     }
+}
+
+fn cmdPlaylists(arena: std.mem.Allocator, env: *std.process.Environ.Map, want: ?[]const u8) !void {
+    const ppath = playlist.path(arena, env) catch {
+        std.debug.print("no playlists (HOME unset)\n", .{});
+        return;
+    };
+    const lists = try playlist.load(arena, ppath);
+    if (lists.len == 0) {
+        std.debug.print("(no playlists — press P on a result in the TUI)\n", .{});
+        return;
+    }
+    var buf: [4096]u8 = undefined;
+    for (lists) |e| {
+        if (want) |name| {
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            for (e.tracks, 0..) |t, i| {
+                try putStdout(try std.fmt.bufPrint(&buf, "{d:2}. {s} — {s}  [{s}]\n", .{ i + 1, t.title, t.artist, t.video_id }));
+            }
+            return;
+        }
+        try putStdout(try std.fmt.bufPrint(&buf, "{s}  [{d}]\n", .{ e.name, e.tracks.len }));
+    }
+    if (want) |name| std.debug.print("no playlist named {s}\n", .{name});
 }
 
 fn cmdHistory(arena: std.mem.Allocator, env: *std.process.Environ.Map) !void {

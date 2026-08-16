@@ -4,6 +4,7 @@
 test {
     _ = @import("theme.zig");
     _ = @import("history.zig");
+    _ = @import("playlist.zig");
     _ = @import("suggest.zig");
     _ = @import("fsutil.zig");
     _ = @import("api.zig");
