@@ -10,4 +10,5 @@ test {
     _ = @import("api.zig");
     _ = @import("ui.zig");
     _ = @import("log.zig");
+    _ = @import("text.zig");
 }

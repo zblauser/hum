@@ -1,6 +1,8 @@
 const std = @import("std");
 
-const c = @cImport({
+/// Shared with the other libc callers (history, playlist, config, api): one place
+/// where the FreeBSD translate-c workarounds have to hold.
+pub const c = @cImport({
     // zig defines _FORTIFY_SOURCE=2 in optimized builds; FreeBSD's ssp
     // (__ssp) inline wrappers then break translate-c. Disable them.
     @cDefine("_FORTIFY_SOURCE", "0");
@@ -24,6 +26,39 @@ pub fn readFileAlloc(arena: std.mem.Allocator, file_path: []const u8) ?[]u8 {
     const n = c.fread(buf.ptr, 1, buf.len, f);
     if (n == 0) return null;
     return buf[0..n];
+}
+
+/// `$<xdg_var>/ytcli/<file>`, else `$HOME/<fallback_dir>/ytcli/<file>`.
+pub fn xdgPath(
+    arena: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    xdg_var: []const u8,
+    fallback_dir: []const u8,
+    file: []const u8,
+) ![:0]const u8 {
+    if (env.get(xdg_var)) |x| {
+        return std.fmt.allocPrintSentinel(arena, "{s}/ytcli/{s}", .{ x, file }, 0);
+    }
+    const home = env.get("HOME") orelse return error.NoHome;
+    return std.fmt.allocPrintSentinel(arena, "{s}/{s}/ytcli/{s}", .{ home, fallback_dir, file }, 0);
+}
+
+/// Create the parent directory, then write (mode "wb") or append (mode "ab") bytes.
+fn writeMode(arena: std.mem.Allocator, file_path: []const u8, bytes: []const u8, mode: [*:0]const u8) !void {
+    if (std.fs.path.dirname(file_path)) |dir| try makePathZ(arena, dir);
+    const path_z = try arena.dupeZ(u8, file_path);
+    const f = c.fopen(path_z.ptr, mode) orelse return error.OpenFailed;
+    defer _ = c.fclose(f);
+    if (bytes.len == 0) return;
+    if (c.fwrite(bytes.ptr, 1, bytes.len, f) != bytes.len) return error.WriteFailed;
+}
+
+pub fn writeFile(arena: std.mem.Allocator, file_path: []const u8, bytes: []const u8) !void {
+    return writeMode(arena, file_path, bytes, "wb");
+}
+
+pub fn appendFile(arena: std.mem.Allocator, file_path: []const u8, bytes: []const u8) !void {
+    return writeMode(arena, file_path, bytes, "ab");
 }
 
 pub fn makePathZ(arena: std.mem.Allocator, dir: []const u8) !void {
@@ -89,7 +124,7 @@ test "makePathZ creates nested dirs and is idempotent" {
     }
 
     try makePathZ(a, nested);
-    try makePathZ(a, nested); 
+    try makePathZ(a, nested);
 
     const f = c.fopen(leaf.ptr, "wb") orelse return error.TestUnexpectedNull;
     _ = c.fclose(f);

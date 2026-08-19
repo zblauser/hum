@@ -1,19 +1,10 @@
 const std = @import("std");
 const fsutil = @import("fsutil.zig");
-
-const c = @cImport({
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-    @cInclude("unistd.h");
-});
+const txt = @import("text.zig");
+const c = fsutil.c;
 
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
-    if (env.get("XDG_DATA_HOME")) |x| {
-        return std.fmt.allocPrintSentinel(arena, "{s}/ytcli/history", .{x}, 0);
-    }
-    const home = env.get("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrintSentinel(arena, "{s}/.local/share/ytcli/history", .{home}, 0);
+    return fsutil.xdgPath(arena, env, "XDG_DATA_HOME", ".local/share", "history");
 }
 
 pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![][]const u8 {
@@ -40,15 +31,25 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![][]const u8 {
     return out.toOwnedSlice(arena);
 }
 
+/// Most recent wins: an existing copy of the same query is dropped so the file holds
+/// one line per search, in the order the list already displays them. Whole-file rewrite,
+/// same as playlists — the file is small and this keeps it hand-editable.
 pub fn append(arena: std.mem.Allocator, file_path: []const u8, query: []const u8) !void {
-    if (std.fs.path.dirname(file_path)) |dir| {
-        try fsutil.makePathZ(arena, dir);
+    const clean = std.mem.trim(u8, try txt.sanitize(arena, query), " \t\r");
+    if (clean.len == 0) return;
+
+    var buf: std.ArrayList(u8) = .empty;
+    if (fsutil.readFileAlloc(arena, file_path)) |bytes| {
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            if (std.mem.eql(u8, trimmed, clean)) continue;
+            try buf.print(arena, "{s}\n", .{trimmed});
+        }
     }
-    const path_z = try arena.dupeZ(u8, file_path);
-    const f = c.fopen(path_z.ptr, "ab") orelse return error.OpenFailed;
-    defer _ = c.fclose(f);
-    if (c.fwrite(query.ptr, 1, query.len, f) != query.len) return error.WriteFailed;
-    if (c.fwrite("\n", 1, 1, f) != 1) return error.WriteFailed;
+    try buf.print(arena, "{s}\n", .{clean});
+    return fsutil.writeFile(arena, file_path, buf.items);
 }
 
 pub fn remove(arena: std.mem.Allocator, file_path: []const u8, query: []const u8) !void {
@@ -68,13 +69,9 @@ pub fn remove(arena: std.mem.Allocator, file_path: []const u8, query: []const u8
     }
     if (!dropped) return error.NotFound;
 
-    const path_z = try arena.dupeZ(u8, file_path);
-    const f = c.fopen(path_z.ptr, "wb") orelse return error.OpenFailed;
-    defer _ = c.fclose(f);
-    for (kept.items) |line| {
-        const out = try std.fmt.allocPrint(arena, "{s}\n", .{line});
-        if (c.fwrite(out.ptr, 1, out.len, f) != out.len) return error.WriteFailed;
-    }
+    var buf: std.ArrayList(u8) = .empty;
+    for (kept.items) |line| try buf.print(arena, "{s}\n", .{line});
+    return fsutil.writeFile(arena, file_path, buf.items);
 }
 
 pub fn match(arena: std.mem.Allocator, items: []const []const u8, prefix: []const u8, max: usize) ![][]const u8 {
@@ -137,4 +134,28 @@ test "load returns empty for a missing file" {
     defer arena.deinit();
     const got = try load(arena.allocator(), "/tmp/ytcli_does_not_exist_zzz");
     try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "append keeps one line per query and moves a repeat to the end" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try a.dupeZ(u8, "/tmp/ytcli_hdup_XXXXXX");
+    const fd = c.mkstemp(p.ptr);
+    try testing.expect(fd >= 0);
+    _ = c.close(fd);
+    defer _ = c.unlink(p.ptr);
+
+    for ([_][]const u8{ "tricot", "autechre", "tricot", "delta sleep", "tricot" }) |q| {
+        try append(a, p, q);
+    }
+
+    const raw = fsutil.readFileAlloc(a, p) orelse return error.TestUnexpectedNull;
+    try testing.expectEqualStrings("autechre\ndelta sleep\ntricot\n", raw);
+
+    // and the display order still puts the newest first
+    const shown = try load(a, p);
+    try testing.expectEqual(@as(usize, 3), shown.len);
+    try testing.expectEqualStrings("tricot", shown[0]);
 }

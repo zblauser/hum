@@ -1,10 +1,7 @@
 const std = @import("std");
 const fsutil = @import("fsutil.zig");
 
-const c = @cImport({
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("stdio.h");
-});
+const c = fsutil.c;
 
 const time_t = std.c.time_t;
 const Tm = opaque {};
@@ -19,11 +16,7 @@ var path_z: ?[:0]const u8 = null;
 /// `$XDG_DATA_HOME/ytcli/log`, else `~/.local/share/ytcli/log` — sits next to
 /// the history file, the location the bug reporter asked for in issue #1.
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]const u8 {
-    if (env.get("XDG_DATA_HOME")) |x| {
-        return std.fmt.allocPrintSentinel(arena, "{s}/ytcli/log", .{x}, 0);
-    }
-    const home = env.get("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrintSentinel(arena, "{s}/.local/share/ytcli/log", .{home}, 0);
+    return fsutil.xdgPath(arena, env, "XDG_DATA_HOME", ".local/share", "log");
 }
 
 /// Resolve the log path and make its directory once at startup. Pass a

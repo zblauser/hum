@@ -1,13 +1,9 @@
 const std = @import("std");
 const api = @import("api.zig");
 const fsutil = @import("fsutil.zig");
+const txt = @import("text.zig");
 
-const c = @cImport({
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-    @cInclude("unistd.h");
-});
+const c = fsutil.c;
 
 pub const Entry = struct {
     name: []const u8,
@@ -15,11 +11,7 @@ pub const Entry = struct {
 };
 
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
-    if (env.get("XDG_DATA_HOME")) |x| {
-        return std.fmt.allocPrintSentinel(arena, "{s}/ytcli/playlists", .{x}, 0);
-    }
-    const home = env.get("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrintSentinel(arena, "{s}/.local/share/ytcli/playlists", .{home}, 0);
+    return fsutil.xdgPath(arena, env, "XDG_DATA_HOME", ".local/share", "playlists");
 }
 
 pub fn cleanName(name: []const u8) []const u8 {
@@ -62,22 +54,21 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![]Entry {
 }
 
 pub fn save(arena: std.mem.Allocator, file_path: []const u8, entries: []const Entry) !void {
-    if (std.fs.path.dirname(file_path)) |dir| try fsutil.makePathZ(arena, dir);
-    const path_z = try arena.dupeZ(u8, file_path);
-    const f = c.fopen(path_z.ptr, "wb") orelse return error.OpenFailed;
-    defer _ = c.fclose(f);
-
+    // sanitize on the way out: a tab or newline inside a title would forge rows in
+    // this file, whatever put the entry in memory
+    var buf: std.ArrayList(u8) = .empty;
     for (entries) |e| {
-        try writeLine(arena, f, "[{s}]\n", .{e.name});
+        try buf.print(arena, "[{s}]\n", .{try txt.sanitize(arena, e.name)});
         for (e.tracks) |t| {
-            try writeLine(arena, f, "{s}\t{s}\t{s}\t{s}\n", .{ t.video_id, t.title, t.artist, t.kind });
+            try buf.print(arena, "{s}\t{s}\t{s}\t{s}\n", .{
+                try txt.sanitize(arena, t.video_id),
+                try txt.sanitize(arena, t.title),
+                try txt.sanitize(arena, t.artist),
+                try txt.sanitize(arena, t.kind),
+            });
         }
     }
-}
-
-fn writeLine(arena: std.mem.Allocator, f: *c.FILE, comptime fmt: []const u8, args: anytype) !void {
-    const line = try std.fmt.allocPrint(arena, fmt, args);
-    if (c.fwrite(line.ptr, 1, line.len, f) != line.len) return error.WriteFailed;
+    return fsutil.writeFile(arena, file_path, buf.items);
 }
 
 pub fn addTrack(arena: std.mem.Allocator, file_path: []const u8, name: []const u8, t: api.Track) !void {
@@ -199,4 +190,26 @@ test "load ignores malformed lines and a missing file" {
     defer arena.deinit();
     const a = arena.allocator();
     try testing.expectEqual(@as(usize, 0), (try load(a, "/tmp/ytcli_pl_missing_zzz")).len);
+}
+
+test "save neutralizes tabs and newlines that would forge rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try tmpPath(a);
+    defer _ = c.unlink(p.ptr);
+
+    var nasty = [_]api.Track{.{
+        .video_id = "abc",
+        .title = "evil\ttitle\n[injected]\nxyz\tfake\tartist\tSong",
+        .artist = "who",
+        .kind = "Song",
+    }};
+    try save(a, p, &[_]Entry{.{ .name = "list", .tracks = nasty[0..] }});
+
+    const back = try load(a, p);
+    try testing.expectEqual(@as(usize, 1), back.len);
+    try testing.expectEqual(@as(usize, 1), back[0].tracks.len);
+    try testing.expectEqualStrings("evil title [injected] xyz fake artist Song", back[0].tracks[0].title);
 }

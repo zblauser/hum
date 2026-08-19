@@ -1,17 +1,8 @@
 const std = @import("std");
 const fsutil = @import("fsutil.zig");
 
-const c = @cImport({
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("stdio.h");
-});
-
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
-    if (env.get("XDG_CONFIG_HOME")) |x| {
-        return std.fmt.allocPrintSentinel(arena, "{s}/ytcli/config", .{x}, 0);
-    }
-    const home = env.get("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrintSentinel(arena, "{s}/.config/ytcli/config", .{home}, 0);
+    return fsutil.xdgPath(arena, env, "XDG_CONFIG_HOME", ".config", "config");
 }
 
 pub fn loadTheme(arena: std.mem.Allocator, file_path: []const u8) ?[]const u8 {
@@ -56,13 +47,7 @@ pub fn saveKey(arena: std.mem.Allocator, file_path: []const u8, key: []const u8,
     try keys.append(arena, key);
     try vals.append(arena, value);
 
-    if (std.fs.path.dirname(file_path)) |dir| try fsutil.makePathZ(arena, dir);
-    const path_z = try arena.dupeZ(u8, file_path);
-    const f = c.fopen(path_z.ptr, "wb") orelse return error.OpenFailed;
-    defer _ = c.fclose(f);
-    for (keys.items, vals.items) |k, v| {
-        const line = try std.fmt.allocPrint(arena, "{s}={s}\n", .{ k, v });
-        if (c.fwrite(line.ptr, 1, line.len, f) != line.len) return error.WriteFailed;
-    }
+    var buf: std.ArrayList(u8) = .empty;
+    for (keys.items, vals.items) |k, v| try buf.print(arena, "{s}={s}\n", .{ k, v });
+    return fsutil.writeFile(arena, file_path, buf.items);
 }
-
