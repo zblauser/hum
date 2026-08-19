@@ -37,7 +37,8 @@ const State = struct {
     suggestions: [][]const u8 = &.{},
     sel_row: ?usize = null,
     scroll_row: usize = 0,
-    last_fetched_query: []const u8 = "",
+    last_fetched_buf: [512]u8 = undefined,
+    last_fetched_len: usize = 0,
     filter: api.Filter = .all,
 
     tracks: []api.Track = &.{},
@@ -158,7 +159,7 @@ pub fn run(
             if (!cont) return;
         } else {
             state.tick +%= 1;
-            if (state.phase == .typing and !std.mem.eql(u8, state.query.items, state.last_fetched_query)) {
+            if (state.phase == .typing and !std.mem.eql(u8, state.query.items, lastFetched(&state))) {
                 refreshSuggestions(gpa, io, &state) catch |err| survive(&state, "suggest", err);
             }
         }
@@ -365,7 +366,7 @@ fn handleTyping(
         .escape => {
             state.query.clearRetainingCapacity();
             state.sel_row = null;
-            state.last_fetched_query = "";
+            state.last_fetched_len = 0;
             _ = state.sug_arena.reset(.retain_capacity);
             state.suggestions = try history.match(state.sug_arena.allocator(), state.hist, "", MAX_SUGGESTIONS);
             state.scroll_row = 0;
@@ -393,12 +394,7 @@ fn handleTyping(
         },
         .enter => if (on_playlist) openPlaylist(state, pls[state.sel_row.?]) else try runSearch(gpa, io, state),
         .backspace => if (state.query.items.len > 0) {
-            var n: usize = 1;
-            while (n <= state.query.items.len) : (n += 1) {
-                const b = state.query.items[state.query.items.len - n];
-                if ((b & 0xC0) != 0x80) break;
-            }
-            state.query.shrinkRetainingCapacity(state.query.items.len - n);
+            popCodepoint(&state.query);
             state.sel_row = null;
             try refreshSuggestionsLocal(state);
         },
@@ -699,14 +695,7 @@ fn handlePicker(gpa: std.mem.Allocator, state: *State, key: Key) !bool {
         },
         .backspace => {
             state.picker_sel = new_row;
-            if (state.picker_name.items.len > 0) {
-                var n: usize = 1;
-                while (n <= state.picker_name.items.len) : (n += 1) {
-                    const b = state.picker_name.items[state.picker_name.items.len - n];
-                    if ((b & 0xC0) != 0x80) break;
-                }
-                state.picker_name.shrinkRetainingCapacity(state.picker_name.items.len - n);
-            }
+            popCodepoint(&state.picker_name);
         },
         .text => |t| {
             state.picker_sel = new_row;
@@ -715,6 +704,17 @@ fn handlePicker(gpa: std.mem.Allocator, state: *State, key: Key) !bool {
         else => {},
     }
     return true;
+}
+
+/// The remote-fetch marker lives in State, not an arena: every suggestion refresh
+/// resets sug_arena, which would leave an arena-allocated copy dangling.
+fn lastFetched(state: *const State) []const u8 {
+    return state.last_fetched_buf[0..state.last_fetched_len];
+}
+
+fn setLastFetched(state: *State, q: []const u8) void {
+    state.last_fetched_len = @min(q.len, state.last_fetched_buf.len);
+    @memcpy(state.last_fetched_buf[0..state.last_fetched_len], q[0..state.last_fetched_len]);
 }
 
 fn refreshSuggestionsLocal(state: *State) !void {
@@ -727,7 +727,7 @@ fn refreshSuggestionsLocal(state: *State) !void {
 fn refreshSuggestions(gpa: std.mem.Allocator, io: std.Io, state: *State) !void {
     _ = state.sug_arena.reset(.retain_capacity);
     const a = state.sug_arena.allocator();
-    state.last_fetched_query = try a.dupe(u8, state.query.items);
+    setLastFetched(state, state.query.items);
     const local = try history.match(a, state.hist, state.query.items, MAX_SUGGESTIONS);
     const remote = suggest.fetch(a, gpa, io, state.query.items, MAX_SUGGESTIONS) catch &.{};
     var out: std.ArrayList([]const u8) = .empty;
@@ -849,6 +849,10 @@ fn cloneTrack(a: std.mem.Allocator, t: api.Track) !api.Track {
 fn playQueueCurrent(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, state: *State) !void {
     if (state.queue.len == 0 or state.queue_idx >= state.queue.len) return;
     const t = state.queue[state.queue_idx];
+    if (!t.isPlayable()) {
+        state.status = "nothing to play there";
+        return;
+    }
 
     const p = try ensurePlayer(gpa, state);
     p.stop();
@@ -877,11 +881,19 @@ fn queueAdvance(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, st
         try playQueueCurrent(gpa, arena, io, state);
         return;
     }
-    if (state.queue_idx + 1 >= state.queue.len) {
+    // results carry artist/album rows with no video_id — skip them, never hand
+    // yt-dlp an empty id
+    var next = state.queue_idx + 1;
+    while (next < state.queue.len and !state.queue[next].isPlayable()) next += 1;
+    if (next >= state.queue.len) {
         if (state.repeat == .queue) {
-            state.queue_idx = 0;
-            try playQueueCurrent(gpa, arena, io, state);
-            return;
+            var first: usize = 0;
+            while (first < state.queue.len and !state.queue[first].isPlayable()) first += 1;
+            if (first < state.queue.len) {
+                state.queue_idx = first;
+                try playQueueCurrent(gpa, arena, io, state);
+                return;
+            }
         }
         if (state.pl) |p| {
             p.stop();
@@ -890,7 +902,7 @@ fn queueAdvance(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, st
         }
         return;
     }
-    state.queue_idx += 1;
+    state.queue_idx = next;
     try playQueueCurrent(gpa, arena, io, state);
 }
 
@@ -903,6 +915,14 @@ fn handlePlayerEvent(
 ) !void {
     switch (ev) {
         .end_file => try queueAdvance(gpa, arena, io, state, true),
+        .file_error => {
+            const why = if (state.pl) |p| p.last_error else "";
+            const title = if (state.now_track) |t| t.title else "";
+            log.write("playback failed: {s} title=\"{s}\"", .{ why, title });
+            state.now_track = null;
+            state.connecting = false;
+            setStatus(state, "playback failed: {s} (see log)", .{why});
+        },
         .shutdown => state.now_track = null,
         else => {},
     }
@@ -940,11 +960,20 @@ fn cpWidth(cp: u21) usize {
 
 const Step = struct { cols: usize, len: usize };
 
+/// One byte at a time is the safe fallback: std.unicode.utf8Decode asserts on a
+/// bad lead byte (0xF8+ panics, it is not a catchable error), and latin-1 text can
+/// reach us from anything we did not encode ourselves.
 fn stepCols(s: []const u8, i: usize) Step {
     const b = s[i];
-    const len: usize = if (b < 0x80) 1 else if (b < 0xC0) 1 else if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
-    if (b < 0x80 or i + len > s.len) return .{ .cols = cpWidth(b), .len = 1 };
-    const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return .{ .cols = 1, .len = len };
+    if (b < 0x80) return .{ .cols = cpWidth(b), .len = 1 };
+    const len: usize = switch (b) {
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => return .{ .cols = 1, .len = 1 },
+    };
+    if (i + len > s.len) return .{ .cols = 1, .len = 1 };
+    const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return .{ .cols = 1, .len = 1 };
     return .{ .cols = cpWidth(cp), .len = len };
 }
 
@@ -1164,6 +1193,16 @@ fn drawSearchRow(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *S
     try w.print("{s}│{s}\r\n", .{ th.accent, th.reset });
 }
 
+/// Backspace deletes a character, not a byte: walk back over UTF-8 continuation bytes.
+fn popCodepoint(buf: *std.ArrayList(u8)) void {
+    if (buf.items.len == 0) return;
+    var n: usize = 1;
+    while (n <= buf.items.len) : (n += 1) {
+        if ((buf.items[buf.items.len - n] & 0xC0) != 0x80) break;
+    }
+    buf.shrinkRetainingCapacity(buf.items.len - @min(n, buf.items.len));
+}
+
 fn clampScroll(scroll: *usize, sel: usize, n: usize, rows: usize) void {
     if (rows == 0 or n == 0) {
         scroll.* = 0;
@@ -1272,26 +1311,19 @@ fn drawResults(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, rows: usize
         const kind_cols = visibleCols(kind_tag);
 
         const text_room = remaining -| kind_cols;
-        const title_budget = if (text_room > sep_cols + 4) (text_room * 2) / 3 else text_room;
-        const title = truncateCols(t.title, title_budget);
-        const title_used = visibleCols(title);
-        const artist_room = text_room -| title_used -| sep_cols;
-        const artist = truncateCols(t.artist, artist_room);
-        const artist_used = visibleCols(artist);
+        const fit = fitTitleArtist(t.title, t.artist, text_room, sep_cols);
 
         if (selected) try w.writeAll(th.highlight);
         try w.writeAll(mark);
         if (!selected) try w.writeAll(th.bold);
-        try w.writeAll(title);
+        try w.writeAll(fit.title);
         if (!selected) try w.writeAll(th.reset);
         try w.writeAll(if (selected) th.highlight else th.dim);
         try w.writeAll(sep);
-        try w.writeAll(artist);
+        try w.writeAll(fit.artist);
         try w.writeAll(th.reset);
 
-        const used = head_cols + title_used + sep_cols + artist_used;
-        const left_pad = text_room -| (used - head_cols);
-        var pad = left_pad;
+        var pad = text_room -| fit.cols;
         while (pad > 0) : (pad -= 1) try w.writeByte(' ');
 
         try w.print("{s}{s}{s}", .{ th.dim, kind_tag, th.reset });
@@ -1300,6 +1332,18 @@ fn drawResults(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, rows: usize
     }
     var rem = rows - (end - start);
     while (rem > 0) : (rem -= 1) try drawRow(w, th, inner, "", .{});
+}
+
+const TitleArtist = struct { title: []const u8, artist: []const u8, cols: usize };
+
+/// Every track row splits its room the same way: two thirds to the title, the rest
+/// to the artist, both cut on column boundaries.
+fn fitTitleArtist(title: []const u8, artist: []const u8, room: usize, sep_cols: usize) TitleArtist {
+    const budget = if (room > sep_cols + 4) (room * 2) / 3 else room;
+    const t = truncateCols(title, budget);
+    const t_cols = visibleCols(t);
+    const a = truncateCols(artist, room -| t_cols -| sep_cols);
+    return .{ .title = t, .artist = a, .cols = t_cols + sep_cols + visibleCols(a) };
 }
 
 fn kindShort(k: []const u8) []const u8 {
@@ -1339,15 +1383,10 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
         try w.print("{s}│{s} ", .{ th.accent, th.reset });
         const room = inner -| 1;
         const sep = "  — ";
-        const sep_cols = visibleCols(sep);
-        const title_budget = if (room > sep_cols + 4) (room * 2) / 3 else room;
-        const title = truncateCols(t.title, title_budget);
-        const tu = visibleCols(title);
-        const artist = truncateCols(t.artist, room -| tu -| sep_cols);
-        const au = visibleCols(artist);
-        try w.print("{s}{s}{s}", .{ th.bold, title, th.reset });
-        try w.print("{s}{s}{s}{s}", .{ th.dim, sep, artist, th.reset });
-        var pad = room -| (tu + sep_cols + au);
+        const fit = fitTitleArtist(t.title, t.artist, room, visibleCols(sep));
+        try w.print("{s}{s}{s}", .{ th.bold, fit.title, th.reset });
+        try w.print("{s}{s}{s}{s}", .{ th.dim, sep, fit.artist, th.reset });
+        var pad = room -| fit.cols;
         while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         try w.print("{s}│{s}\r\n", .{ th.accent, th.reset });
     }
@@ -1410,15 +1449,10 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
         if (state.queue.len > 0 and state.queue_idx + 1 < state.queue.len) {
             const nt = state.queue[state.queue_idx + 1];
             const sep = " — ";
-            const sep_cols = visibleCols(sep);
-            const title_budget = if (text_room > sep_cols + 4) (text_room * 2) / 3 else text_room;
-            const title = truncateCols(nt.title, title_budget);
-            const tu = visibleCols(title);
-            const artist = truncateCols(nt.artist, text_room -| tu -| sep_cols);
-            const au = visibleCols(artist);
-            try w.writeAll(title);
-            try w.print("{s}{s}{s}{s}", .{ th.dim, sep, artist, th.reset });
-            used_n += tu + sep_cols + au;
+            const fit = fitTitleArtist(nt.title, nt.artist, text_room, visibleCols(sep));
+            try w.writeAll(fit.title);
+            try w.print("{s}{s}{s}{s}", .{ th.dim, sep, fit.artist, th.reset });
+            used_n += fit.cols;
         } else {
             const msg = "queue end · esc back to search for more";
             const shown = truncateCols(msg, text_room);
@@ -1542,6 +1576,22 @@ test "visibleCols counts CJK and fullwidth as two columns" {
     try testing.expectEqual(@as(usize, 2), visibleCols("\x1b[31m唄\x1b[0m"));
     try testing.expectEqual(@as(usize, 1), visibleCols("é"));
     try testing.expectEqual(@as(usize, 1), visibleCols("e\u{301}"));
+}
+
+test "column math survives invalid UTF-8 (latin-1 from suggest endpoint)" {
+    // 0xFC is "ü" in latin-1; as a UTF-8 lead byte it used to reach utf8Decode4 and panic
+    const bad = "mot\xfcrhead";
+    try testing.expectEqual(@as(usize, 9), visibleCols(bad));
+    try testing.expectEqualStrings("mot", truncateCols(bad, 3));
+    try testing.expectEqual(@as(usize, 4), visibleCols(truncateCols(bad, 4)));
+    try testing.expectEqual(@as(usize, 4), visibleCols(tailCols(bad, 4)));
+
+    const lone_lead = "ab\xf0";
+    try testing.expectEqual(@as(usize, 3), visibleCols(lone_lead));
+    const stray_cont = "\x80\xbfok";
+    try testing.expectEqual(@as(usize, 4), visibleCols(stray_cont));
+    const truncated_wide = "\xe6\xbc"; // first two bytes of 漢
+    try testing.expectEqual(@as(usize, 2), visibleCols(truncated_wide));
 }
 
 test "truncateCols never splits a wide char" {

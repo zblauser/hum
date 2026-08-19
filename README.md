@@ -18,7 +18,18 @@ zig 0.16, single binary
 - astats lavfi filter for visualizer via `ffmpeg`
 
 ## version
-<b>v0.1.5</b>
+<b>v0.1.6</b>
+- fix crash on non-UTF-8 autocomplete (the suggest endpoint answers in latin-1 without `ie`/`oe=utf-8`)
+- remote text is scrubbed of control bytes before it reaches your terminal or your history/playlist files
+- autoplay skips rows with no video id instead of calling `yt-dlp` with an empty one
+- your history file keeps one line per search instead of piling up duplicates
+- a stream that fails to open now says so in the status bar instead of sitting at `00:00`
+- `curl`/`yt-dlp` calls now have timeouts and an output cap
+- playback needs a current `yt-dlp`: stale versions get 403'd by youtube and sit at `00:00`
+
+<details>
+<summary>v0.1.5</summary><br>
+
 - **playlists**: build as you browse: `P` saves the selected result, `Ctrl+A` saves whatever is playing; create a new list or add to an existing list
 - your playlists sit above recent searches on the search screen
 - `Ctrl+X` twice deletes the selected playlist *or* forgets the selected past search; `d`/`Ctrl+X` removes a track from an open playlist
@@ -28,6 +39,8 @@ zig 0.16, single binary
 - 5 new themes (tokyonight, catppuccin, matrix, rosepine, solarized)
 - frames drawn inside synchronized output — no tearing on theme switch
 - recoverable failures land in log and status bar instead of dropping you out
+</details>
+
 <details>
 <summary>previous</summary><br>
 
@@ -76,7 +89,7 @@ apt install libmpv-dev yt-dlp ffmpeg   # Debian/Ubuntu
 ```
 <br>
 
-> **[ ! ]** currently requires `mpv`, `ffmpeg` and `yt-dlp` particularly on PATH
+> **[ ! ]** currently requires `mpv`, `ffmpeg` and `yt-dlp` particularly on PATH — keep `yt-dlp` updated, youtube breaks old versions
 
 ## releases
 

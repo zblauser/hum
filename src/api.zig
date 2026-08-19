@@ -1,5 +1,7 @@
 const std = @import("std");
 const proc = @import("proc.zig");
+const txt = @import("text.zig");
+const fsutil = @import("fsutil.zig");
 
 // Public InnerTube (YouTube Music WEB_REMIX) client key. Not a secret: this exact
 // key is served in every youtube music web page and is required to reach the
@@ -15,11 +17,7 @@ const CLIENT_CONTEXT =
     \\"context":{"client":{"clientName":"WEB_REMIX","clientVersion":"1.20240101.00.00","hl":"en","gl":"US"},"user":{}}
 ;
 
-const c = @cImport({
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("stdlib.h");
-    @cInclude("unistd.h");
-});
+const c = fsutil.c;
 
 pub const Track = struct {
     video_id: []const u8 = "",
@@ -80,18 +78,7 @@ pub fn searchFiltered(
     filter: Filter,
 ) ![]Track {
     const body = try buildBodyFiltered(arena, query, filter);
-    const body_path = try writeTempFile(arena, body);
-    defer _ = c.unlink(body_path.ptr);
-    const data_arg = try std.fmt.allocPrint(arena, "@{s}", .{body_path});
-
-    const resp = try proc.runCapture(gpa, io, &.{
-        "curl", "-sS",
-        "-H",   "Content-Type: application/json",
-        "-H",   "User-Agent: Mozilla/5.0",
-        "-X",   "POST",
-        "--data-binary", data_arg,
-        SEARCH_URL,
-    });
+    const resp = try postJson(arena, gpa, io, SEARCH_URL, body);
     defer gpa.free(resp);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, resp, .{});
@@ -171,30 +158,20 @@ fn extractTrack(arena: std.mem.Allocator, item: std.json.Value) ?Track {
     }
 
     return .{
-        .video_id = arena.dupe(u8, video_id_str) catch return null,
-        .browse_id = arena.dupe(u8, browse_id_str) catch return null,
-        .title = arena.dupe(u8, title) catch return null,
-        .artist = arena.dupe(u8, artist) catch return null,
-        .kind = arena.dupe(u8, kind) catch return null,
+        .video_id = txt.sanitizeDupe(arena, video_id_str) orelse return null,
+        .browse_id = txt.sanitizeDupe(arena, browse_id_str) orelse return null,
+        .title = txt.sanitizeDupe(arena, title) orelse return null,
+        .artist = txt.sanitizeDupe(arena, artist) orelse return null,
+        .kind = txt.sanitizeDupe(arena, kind) orelse return null,
     };
 }
 
 const BROWSE_URL = "https://music.youtube.com/youtubei/v1/browse?key=" ++ INNERTUBE_KEY ++ "&prettyPrint=false";
 
 pub fn browseAlbum(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, browse_id: []const u8) ![]Track {
-    const body = try std.fmt.allocPrint(arena, "{{{s},\"browseId\":\"{s}\"}}", .{ CLIENT_CONTEXT, browse_id });
-    const body_path = try writeTempFile(arena, body);
-    defer _ = c.unlink(body_path.ptr);
-    const data_arg = try std.fmt.allocPrint(arena, "@{s}", .{body_path});
-
-    const resp = try proc.runCapture(gpa, io, &.{
-        "curl",          "-sS",
-        "-H",            "Content-Type: application/json",
-        "-H",            "User-Agent: Mozilla/5.0",
-        "-X",            "POST",
-        "--data-binary", data_arg,
-        BROWSE_URL,
-    });
+    const id = try std.json.Stringify.valueAlloc(arena, browse_id, .{});
+    const body = try std.fmt.allocPrint(arena, "{{{s},\"browseId\":{s}}}", .{ CLIENT_CONTEXT, id });
+    const resp = try postJson(arena, gpa, io, BROWSE_URL, body);
     defer gpa.free(resp);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, resp, .{});
@@ -203,7 +180,7 @@ pub fn browseAlbum(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io,
     if (out.items.len == 0) return error.NoResult;
 
     if (findAlbumArtist(parsed.value)) |alb| {
-        const dup = arena.dupe(u8, alb) catch alb;
+        const dup = txt.sanitizeDupe(arena, alb) orelse alb;
         for (out.items) |*t| {
             if (std.mem.eql(u8, t.artist, "unknown")) t.artist = dup;
         }
@@ -336,6 +313,25 @@ fn buildBodyFiltered(arena: std.mem.Allocator, query: []const u8, filter: Filter
     return std.fmt.allocPrint(arena, "{{{s},\"query\":{s},\"params\":\"{s}\"}}", .{ CLIENT_CONTEXT, escaped, params });
 }
 
+/// POST a JSON body to an InnerTube endpoint. The body goes through a 0600 temp file
+/// rather than an argv entry: queries are user text and would otherwise be visible in
+/// the process list of every other user on the machine.
+fn postJson(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, url: []const u8, body: []const u8) ![]u8 {
+    const body_path = try writeTempFile(arena, body);
+    defer _ = c.unlink(body_path.ptr);
+    const data_arg = try std.fmt.allocPrint(arena, "@{s}", .{body_path});
+
+    return proc.runCapture(gpa, io, &.{
+        "curl",          "-sS",
+        "--max-time",    "20",
+        "-H",            "Content-Type: application/json",
+        "-H",            "User-Agent: Mozilla/5.0",
+        "-X",            "POST",
+        "--data-binary", data_arg,
+        url,
+    });
+}
+
 fn writeTempFile(arena: std.mem.Allocator, body: []const u8) ![:0]const u8 {
     const path = try arena.dupeZ(u8, TMP_TEMPLATE);
     const fd = c.mkstemp(path.ptr);
@@ -378,8 +374,8 @@ test "buildBodyFiltered emits valid JSON with shared context" {
     const filtered = try buildBodyFiltered(a, "x", .songs);
     const p2 = try std.json.parseFromSlice(std.json.Value, a, filtered, .{});
     try testing.expect(p2.value.object.get("params") != null);
-    
-	try testing.expectEqualStrings(
+
+    try testing.expectEqualStrings(
         "WEB_REMIX",
         p2.value.object.get("context").?.object.get("client").?.object.get("clientName").?.string,
     );
@@ -414,8 +410,6 @@ test "collectTracks extracts a song from an InnerTube fixture" {
 }
 
 test "findAlbumArtist reads the header, not a related-artist carousel" {
-    // "contents" (with a Dead Can Dance related link) precedes "header" in the
-    // JSON exactly as YTM serves it — the old global scan returned the carousel.
     const json =
         \\{"contents":{"sectionListRenderer":{"contents":[
         \\  {"musicCarouselShelfRenderer":{"contents":[
@@ -456,5 +450,3 @@ test "findAlbumArtist reads legacy musicDetailHeaderRenderer subtitle" {
         findAlbumArtist(parsed.value).?,
     );
 }
-
-

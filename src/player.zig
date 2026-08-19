@@ -11,11 +11,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
-pub const Event = enum { none, end_file, started, idle, shutdown };
+pub const Event = enum { none, end_file, file_error, started, idle, shutdown };
 
 pub const Player = struct {
     handle: *c.mpv_handle,
     has_track: bool = false,
+    /// Set alongside a `.file_error` event. Points at a static libmpv string.
+    last_error: []const u8 = "",
 
     pub fn init() Error!Player {
         const h = c.mpv_create() orelse return error.MpvCreate;
@@ -142,7 +144,15 @@ pub const Player = struct {
             c.MPV_EVENT_NONE => .none,
             c.MPV_EVENT_END_FILE => blk: {
                 const ef: *c.mpv_event_end_file = @ptrCast(@alignCast(ev.*.data));
-                break :blk if (ef.reason == c.MPV_END_FILE_REASON_EOF) .end_file else .none;
+                if (ef.reason == c.MPV_END_FILE_REASON_EOF) break :blk .end_file;
+                // a stream that fails to open ends here; swallowing it left the UI
+                // reporting "playing" at 00:00 forever (see issue #6)
+                if (ef.reason == c.MPV_END_FILE_REASON_ERROR) {
+                    self.has_track = false;
+                    self.last_error = std.mem.span(c.mpv_error_string(ef.@"error"));
+                    break :blk .file_error;
+                }
+                break :blk .none;
             },
             c.MPV_EVENT_FILE_LOADED => .started,
             c.MPV_EVENT_IDLE => .idle,
