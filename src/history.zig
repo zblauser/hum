@@ -31,9 +31,7 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![][]const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Most recent wins: an existing copy of the same query is dropped so the file holds
-/// one line per search, in the order the list already displays them. Whole-file rewrite,
-/// same as playlists — the file is small and this keeps it hand-editable.
+/// Most recent wins: one line per search, rewritten whole to stay hand-editable.
 pub fn append(arena: std.mem.Allocator, file_path: []const u8, query: []const u8) !void {
     const clean = std.mem.trim(u8, try txt.sanitize(arena, query), " \t\r");
     if (clean.len == 0) return;
@@ -113,7 +111,7 @@ test "remove drops one entry and keeps the rest" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const p = try a.dupeZ(u8, "/tmp/ytcli_hist_XXXXXX");
+    const p = try a.dupeZ(u8, "/tmp/hum_hist_XXXXXX");
     const fd = c.mkstemp(p.ptr);
     try testing.expect(fd >= 0);
     _ = c.close(fd);
@@ -132,7 +130,7 @@ test "remove drops one entry and keeps the rest" {
 test "load returns empty for a missing file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const got = try load(arena.allocator(), "/tmp/ytcli_does_not_exist_zzz");
+    const got = try load(arena.allocator(), "/tmp/hum_does_not_exist_zzz");
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
@@ -141,7 +139,7 @@ test "append keeps one line per query and moves a repeat to the end" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const p = try a.dupeZ(u8, "/tmp/ytcli_hdup_XXXXXX");
+    const p = try a.dupeZ(u8, "/tmp/hum_hdup_XXXXXX");
     const fd = c.mkstemp(p.ptr);
     try testing.expect(fd >= 0);
     _ = c.close(fd);

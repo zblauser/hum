@@ -1,6 +1,7 @@
 const std = @import("std");
 const api = @import("api.zig");
 const fsutil = @import("fsutil.zig");
+const track_mod = @import("track.zig");
 const txt = @import("text.zig");
 
 const c = fsutil.c;
@@ -43,28 +44,45 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![]Entry {
         }
         if (name == null) continue;
         var f = std.mem.splitScalar(u8, line, '\t');
-        const id = f.next() orelse continue;
+        const target = f.next() orelse continue;
         const title = f.next() orelse continue;
         const artist = f.next() orelse "";
         const kind = f.next() orelse "Song";
-        try tracks.append(arena, .{ .video_id = id, .title = title, .artist = artist, .kind = kind });
+        // a four-column row predates the source column and is a YouTube track
+        const source = track_mod.sourceByName(f.next() orelse "");
+        const duration = track_mod.parseDuration(f.next() orelse "");
+        try tracks.append(arena, .{
+            .source = source,
+            .video_id = if (source == .youtube) target else "",
+            .uri = if (source == .youtube) "" else target,
+            .title = title,
+            .artist = artist,
+            .duration_s = duration,
+            .kind = kind,
+        });
     }
     if (name) |n| try out.append(arena, .{ .name = n, .tracks = try tracks.toOwnedSlice(arena) });
     return out.toOwnedSlice(arena);
 }
 
+/// One target column: a video id, or a path/URL.
+fn targetOf(t: api.Track) []const u8 {
+    return if (t.source == .youtube) t.video_id else t.uri;
+}
+
 pub fn save(arena: std.mem.Allocator, file_path: []const u8, entries: []const Entry) !void {
-    // sanitize on the way out: a tab or newline inside a title would forge rows in
-    // this file, whatever put the entry in memory
+    // sanitize on write: a tab or newline in a title would forge rows here
     var buf: std.ArrayList(u8) = .empty;
     for (entries) |e| {
         try buf.print(arena, "[{s}]\n", .{try txt.sanitize(arena, e.name)});
         for (e.tracks) |t| {
-            try buf.print(arena, "{s}\t{s}\t{s}\t{s}\n", .{
-                try txt.sanitize(arena, t.video_id),
+            try buf.print(arena, "{s}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
+                try txt.sanitize(arena, targetOf(t)),
                 try txt.sanitize(arena, t.title),
                 try txt.sanitize(arena, t.artist),
                 try txt.sanitize(arena, t.kind),
+                track_mod.sourceName(t.source),
+                t.duration_s,
             });
         }
     }
@@ -73,7 +91,7 @@ pub fn save(arena: std.mem.Allocator, file_path: []const u8, entries: []const En
 
 pub fn addTrack(arena: std.mem.Allocator, file_path: []const u8, name: []const u8, t: api.Track) !void {
     const clean = cleanName(name);
-    if (clean.len == 0 or t.video_id.len == 0) return error.InvalidEntry;
+    if (clean.len == 0 or !t.isPlayable()) return error.InvalidEntry;
 
     var entries: std.ArrayList(Entry) = .empty;
     try entries.appendSlice(arena, try load(arena, file_path));
@@ -81,7 +99,9 @@ pub fn addTrack(arena: std.mem.Allocator, file_path: []const u8, name: []const u
     for (entries.items) |*e| {
         if (!std.mem.eql(u8, e.name, clean)) continue;
         for (e.tracks) |have| {
-            if (std.mem.eql(u8, have.video_id, t.video_id)) return error.AlreadyPresent;
+            if (have.source == t.source and std.mem.eql(u8, targetOf(have), targetOf(t))) {
+                return error.AlreadyPresent;
+            }
         }
         var list: std.ArrayList(api.Track) = .empty;
         try list.appendSlice(arena, e.tracks);
@@ -125,7 +145,7 @@ pub fn removeList(arena: std.mem.Allocator, file_path: []const u8, name: []const
 const testing = std.testing;
 
 fn tmpPath(a: std.mem.Allocator) ![:0]const u8 {
-    const p = try a.dupeZ(u8, "/tmp/ytcli_pl_XXXXXX");
+    const p = try a.dupeZ(u8, "/tmp/hum_pl_XXXXXX");
     const fd = c.mkstemp(p.ptr);
     if (fd < 0) return error.TempFailed;
     _ = c.close(fd);
@@ -189,7 +209,7 @@ test "load ignores malformed lines and a missing file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqual(@as(usize, 0), (try load(a, "/tmp/ytcli_pl_missing_zzz")).len);
+    try testing.expectEqual(@as(usize, 0), (try load(a, "/tmp/hum_pl_missing_zzz")).len);
 }
 
 test "save neutralizes tabs and newlines that would forge rows" {
@@ -212,4 +232,64 @@ test "save neutralizes tabs and newlines that would forge rows" {
     try testing.expectEqual(@as(usize, 1), back.len);
     try testing.expectEqual(@as(usize, 1), back[0].tracks.len);
     try testing.expectEqualStrings("evil title [injected] xyz fake artist Song", back[0].tracks[0].title);
+}
+
+test "load reads pre-v0.1.7 four-column rows as youtube tracks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try tmpPath(a);
+    defer _ = c.unlink(p.ptr);
+    try fsutil.writeFile(a, p, "[old]\nabc\tOne\tA\tSong\n");
+
+    const got = try load(a, p);
+    try testing.expectEqual(@as(usize, 1), got[0].tracks.len);
+    const t = got[0].tracks[0];
+    try testing.expectEqual(track_mod.Source.youtube, t.source);
+    try testing.expectEqualStrings("abc", t.video_id);
+    try testing.expectEqualStrings("", t.uri);
+    try testing.expect(t.isPlayable());
+}
+
+test "local rows round-trip through save and load" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try tmpPath(a);
+    defer _ = c.unlink(p.ptr);
+
+    const local: api.Track = .{
+        .source = .local,
+        .uri = "/music/Bohren/Black Earth/01 Midnight Black Earth.flac",
+        .title = "Midnight Black Earth",
+        .artist = "Bohren & der Club of Gore",
+        .duration_s = 222,
+        .kind = "Song",
+    };
+    try addTrack(a, p, "mix", local);
+    try addTrack(a, p, "mix", .{ .video_id = "abc", .title = "Yt One", .artist = "A", .kind = "Song" });
+    try testing.expectError(error.AlreadyPresent, addTrack(a, p, "mix", local));
+
+    const got = try load(a, p);
+    try testing.expectEqual(@as(usize, 2), got[0].tracks.len);
+    const back = got[0].tracks[0];
+    try testing.expectEqual(track_mod.Source.local, back.source);
+    try testing.expectEqualStrings(local.uri, back.uri);
+    try testing.expectEqualStrings("", back.video_id);
+    try testing.expectEqual(@as(u32, 222), back.duration_s);
+    try testing.expect(back.isPlayable());
+    try testing.expectEqual(track_mod.Source.youtube, got[0].tracks[1].source);
+}
+
+test "addTrack refuses a row with no playable target" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try tmpPath(a);
+    defer _ = c.unlink(p.ptr);
+
+    try testing.expectError(error.InvalidEntry, addTrack(a, p, "mix", .{ .title = "no target", .artist = "A" }));
+    try testing.expectError(error.InvalidEntry, addTrack(a, p, "mix", .{ .source = .local, .title = "no path", .artist = "A" }));
 }

@@ -145,8 +145,7 @@ pub const Player = struct {
             c.MPV_EVENT_END_FILE => blk: {
                 const ef: *c.mpv_event_end_file = @ptrCast(@alignCast(ev.*.data));
                 if (ef.reason == c.MPV_END_FILE_REASON_EOF) break :blk .end_file;
-                // a stream that fails to open ends here; swallowing it left the UI
-                // reporting "playing" at 00:00 forever (see issue #6)
+                // a stream that fails to open ends here; swallowing it reports playing at 00:00
                 if (ef.reason == c.MPV_END_FILE_REASON_ERROR) {
                     self.has_track = false;
                     self.last_error = std.mem.span(c.mpv_error_string(ef.@"error"));

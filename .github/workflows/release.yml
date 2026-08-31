@@ -34,11 +34,11 @@ jobs:
           zig build -Doptimize=ReleaseSafe -Dmpv-prefix=
 
       - name: package
-        run: tar -czf "ytcli-${{ matrix.name }}.tar.gz" -C zig-out/bin ytcli
+        run: tar -czf "hum-${{ matrix.name }}.tar.gz" -C zig-out/bin hum
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: ytcli-${{ matrix.name }}.tar.gz
+          files: hum-${{ matrix.name }}.tar.gz
 
   # Single universal (arm64 + x86_64) binary, cross-built on one Apple-silicon
   # runner and lipo'd — avoids the scarce macos-13 Intel runner entirely.
@@ -72,50 +72,69 @@ jobs:
           X86_MPV="$(arch -x86_64 /usr/local/bin/brew --prefix mpv)"
           zig build test -Dmpv-prefix="$ARM_MPV"
           zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dmpv-prefix="$ARM_MPV"
-          cp zig-out/bin/ytcli ytcli-arm64
+          cp zig-out/bin/hum hum-arm64
           zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos -Dmpv-prefix="$X86_MPV"
-          cp zig-out/bin/ytcli ytcli-x86_64
-          lipo -create -output ytcli ytcli-arm64 ytcli-x86_64
-          lipo -info ytcli
-          file ytcli
+          cp zig-out/bin/hum hum-x86_64
+          lipo -create -output hum hum-arm64 hum-x86_64
+          lipo -info hum
+          file hum
 
       - name: package
-        run: tar -czf ytcli-macos-universal.tar.gz ytcli
+        run: tar -czf hum-macos-universal.tar.gz hum
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: ytcli-macos-universal.tar.gz
+          files: hum-macos-universal.tar.gz
 
+  # Everything here runs inside an emulated FreeBSD VM, so every step is
+  # 5-10x its native cost. The 30-minute cap was being hit; the work was
+  # a 55MB in-VM toolchain download plus two full compiles.
   build-freebsd:
     name: freebsd-x86_64
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
+      # Pull the toolchain on the fast host (and cache it between releases)
+      # instead of over the VM's emulated network. The VM sees the workspace.
+      - name: cache zig tarball
+        id: zigcache
+        uses: actions/cache@v4
+        with:
+          path: zig-freebsd.tar.xz
+          key: zig-freebsd-0.16.0
+
+      - name: fetch zig (host)
+        if: steps.zigcache.outputs.cache-hit != 'true'
+        run: curl -fsSL -o zig-freebsd.tar.xz "https://ziglang.org/download/0.16.0/zig-x86_64-freebsd-0.16.0.tar.xz"
+
       - uses: vmactions/freebsd-vm@v1
-        env:
-          ZIG: "0.16.0"
         with:
           usesh: true
-          envs: "ZIG"
           prepare: |
             set -e
+            # mpv drags in ffmpeg/X11/vulkan; we only ever link libmpv, but the
+            # port is how FreeBSD ships it. Keep the set otherwise minimal.
             pkg install -y mpv pkgconf curl
-            fetch -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG}/zig-x86_64-freebsd-${ZIG}.tar.xz"
-            mkdir -p /opt/zig
-            tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-            ln -sf /opt/zig/zig /usr/local/bin/zig
           run: |
             set -e
+            # Unpacked here rather than in `prepare`: this block is the one that
+            # is guaranteed to run inside the synced workspace, where the
+            # host-fetched tarball actually is.
+            mkdir -p /opt/zig
+            tar -xJf zig-freebsd.tar.xz -C /opt/zig --strip-components=1
+            ln -sf /opt/zig/zig /usr/local/bin/zig
             zig version
-            zig build test -Dmpv-prefix=/usr/local
+            # Tests already run on the linux and macos legs of this same
+            # workflow. Repeating them here bought a second full compile in the
+            # slowest environment we have, for no extra coverage.
             zig build -Doptimize=ReleaseSafe -Dmpv-prefix=/usr/local
 
       - name: package
-        run: tar -czf ytcli-freebsd-x86_64.tar.gz -C zig-out/bin ytcli
+        run: tar -czf hum-freebsd-x86_64.tar.gz -C zig-out/bin hum
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: ytcli-freebsd-x86_64.tar.gz
+          files: hum-freebsd-x86_64.tar.gz
