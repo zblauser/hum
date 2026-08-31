@@ -9,18 +9,15 @@ extern "c" fn time(?*time_t) time_t;
 extern "c" fn localtime(*const time_t) ?*Tm;
 extern "c" fn strftime(noalias [*]u8, usize, noalias [*:0]const u8, noalias *const Tm) usize;
 
-// Resolved once at startup via init(); null leaves logging a no-op so callers
-// never have to care whether a log file is available.
+// null leaves logging a no-op, so callers never check
 var path_z: ?[:0]const u8 = null;
 
-/// `$XDG_DATA_HOME/ytcli/log`, else `~/.local/share/ytcli/log` — sits next to
-/// the history file, the location the bug reporter asked for in issue #1.
+/// $XDG_DATA_HOME/hum/log, beside the history file.
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]const u8 {
     return fsutil.xdgPath(arena, env, "XDG_DATA_HOME", ".local/share", "log");
 }
 
-/// Resolve the log path and make its directory once at startup. Pass a
-/// long-lived allocator (the program arena); on any failure logging stays off.
+/// Pass a long-lived allocator; on any failure logging stays off.
 pub fn init(arena: std.mem.Allocator, env: *std.process.Environ.Map) void {
     const p = path(arena, env) catch return;
     if (std.fs.path.dirname(p)) |dir| {
@@ -29,8 +26,7 @@ pub fn init(arena: std.mem.Allocator, env: *std.process.Environ.Map) void {
     path_z = p;
 }
 
-/// Append a timestamped line. Best-effort: any error is swallowed so a logging
-/// problem never masks or replaces the original failure being reported.
+/// Best-effort: errors are swallowed so logging never masks the original failure.
 pub fn write(comptime fmt: []const u8, args: anytype) void {
     const p = path_z orelse return;
 
@@ -62,11 +58,11 @@ test "path honors XDG_DATA_HOME and falls back to HOME" {
 
     var xdg: std.process.Environ.Map = .init(a);
     try xdg.put("XDG_DATA_HOME", "/data");
-    try testing.expectEqualStrings("/data/ytcli/log", try path(a, &xdg));
+    try testing.expectEqualStrings("/data/hum/log", try path(a, &xdg));
 
     var home: std.process.Environ.Map = .init(a);
     try home.put("HOME", "/home/u");
-    try testing.expectEqualStrings("/home/u/.local/share/ytcli/log", try path(a, &home));
+    try testing.expectEqualStrings("/home/u/.local/share/hum/log", try path(a, &home));
 
     var empty: std.process.Environ.Map = .init(a);
     try testing.expectError(error.NoHome, path(a, &empty));

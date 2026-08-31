@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: test + cross-target check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: install libmpv
+        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+
+      - name: unit tests
+        run: |
+          zig build test -Dmpv-prefix=
+          zig build test -Doptimize=ReleaseSafe -Dmpv-prefix=
+
+      # Type-checks freebsd/linux/macos in Debug and ReleaseSafe without
+      # linking. The FreeBSD release leg has broken twice on translate-c; this
+      # catches that on every push instead of at tag time inside a VM.
+      - name: cross-target check
+        run: zig build check

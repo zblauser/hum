@@ -2,34 +2,23 @@ const std = @import("std");
 const proc = @import("proc.zig");
 const txt = @import("text.zig");
 const fsutil = @import("fsutil.zig");
+const track_mod = @import("track.zig");
 
-// Public InnerTube (YouTube Music WEB_REMIX) client key. Not a secret: this exact
-// key is served in every youtube music web page and is required to reach the
-// public youtubei endpoints. GitHub secret-scanning flags it by pattern; safe to keep.
+// Public WEB_REMIX client key, served in every YouTube Music page. Not a secret; secret scanners flag it by pattern.
 const INNERTUBE_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 const SEARCH_URL = "https://music.youtube.com/youtubei/v1/search?key=" ++ INNERTUBE_KEY ++ "&prettyPrint=false";
-const TMP_TEMPLATE = "/tmp/ytcli_bodyXXXXXX";
+const TMP_TEMPLATE = "/tmp/hum_bodyXXXXXX";
 
-// Shared InnerTube request context (WEB_REMIX client). Real braces — embedded
-// verbatim into request bodies, so allocPrint format strings only add the
-// surrounding object and per-call fields.
+// Embedded verbatim into request bodies, so format strings add only the surrounding object.
 const CLIENT_CONTEXT =
     \\"context":{"client":{"clientName":"WEB_REMIX","clientVersion":"1.20240101.00.00","hl":"en","gl":"US"},"user":{}}
 ;
 
 const c = fsutil.c;
 
-pub const Track = struct {
-    video_id: []const u8 = "",
-    browse_id: []const u8 = "",
-    title: []const u8,
-    artist: []const u8,
-    kind: []const u8 = "Song",
-
-    pub fn isPlayable(self: Track) bool {
-        return self.video_id.len > 0;
-    }
-};
+// Track is not an api type; re-exported so `api.Track` references keep working.
+pub const Track = track_mod.Track;
+pub const Source = track_mod.Source;
 
 pub const Filter = enum {
     all,
@@ -84,29 +73,40 @@ pub fn searchFiltered(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, resp, .{});
 
     var out: std.ArrayList(Track) = .empty;
-    try collectTracks(arena, parsed.value, &out, max);
+    try collectTracks(arena, parsed.value, &out, max, "");
     if (out.items.len == 0) return error.NoResult;
     return out.toOwnedSlice(arena);
 }
 
-fn collectTracks(arena: std.mem.Allocator, v: std.json.Value, out: *std.ArrayList(Track), max: usize) !void {
+/// Rows inside a card shelf drop the artist from their subtitle because the card header carries it.
+fn collectTracks(
+    arena: std.mem.Allocator,
+    v: std.json.Value,
+    out: *std.ArrayList(Track),
+    max: usize,
+    inherited: []const u8,
+) !void {
     if (out.items.len >= max) return;
     switch (v) {
         .object => |obj| {
+            var artist_ctx = inherited;
+            if (obj.get("musicCardShelfRenderer")) |card| {
+                if (cardArtist(card)) |a| artist_ctx = a;
+            }
             if (obj.get("musicResponsiveListItemRenderer")) |item| {
-                if (extractTrack(arena, item)) |t| {
+                if (extractTrack(arena, item, artist_ctx)) |t| {
                     try out.append(arena, t);
                 }
             }
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try collectTracks(arena, entry.value_ptr.*, out, max);
+                try collectTracks(arena, entry.value_ptr.*, out, max, artist_ctx);
                 if (out.items.len >= max) return;
             }
         },
         .array => |arr| {
             for (arr.items) |item| {
-                try collectTracks(arena, item, out, max);
+                try collectTracks(arena, item, out, max, inherited);
                 if (out.items.len >= max) return;
             }
         },
@@ -114,7 +114,29 @@ fn collectTracks(arena: std.mem.Allocator, v: std.json.Value, out: *std.ArrayLis
     }
 }
 
-fn extractTrack(arena: std.mem.Allocator, item: std.json.Value) ?Track {
+/// The card's artist is the first UC-linked run in its title, else in its subtitle.
+fn cardArtist(card: std.json.Value) ?[]const u8 {
+    if (card != .object) return null;
+    inline for (.{ "title", "subtitle" }) |key| {
+        if (card.object.get(key)) |node| {
+            if (node == .object) {
+                if (node.object.get("runs")) |runs| {
+                    if (runs == .array) {
+                        for (runs.array.items) |run| {
+                            const bid = browseIdOfRun(run) orelse continue;
+                            if (std.mem.startsWith(u8, bid, "UC")) {
+                                if (textOfRun(run)) |t| return t;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn extractTrack(arena: std.mem.Allocator, item: std.json.Value, inherited: []const u8) ?Track {
     if (item != .object) return null;
     const obj = item.object;
 
@@ -144,7 +166,7 @@ fn extractTrack(arena: std.mem.Allocator, item: std.json.Value) ?Track {
     if (flex != .array or flex.array.items.len == 0) return null;
 
     const title = flexText(flex.array.items[0]) orelse return null;
-    var artist: []const u8 = "unknown";
+    var artist: []const u8 = if (inherited.len > 0) inherited else "unknown";
     var kind: []const u8 = "Song";
     if (flex.array.items.len > 1) {
         if (flexRuns(flex.array.items[1])) |r| {
@@ -157,11 +179,19 @@ fn extractTrack(arena: std.mem.Allocator, item: std.json.Value) ?Track {
         }
     }
 
+    var album: []const u8 = "";
+    if (flex.array.items.len > 1) {
+        if (flexRuns(flex.array.items[1])) |r| album = albumOfRuns(r) orelse "";
+    }
+
     return .{
+        .source = .youtube,
         .video_id = txt.sanitizeDupe(arena, video_id_str) orelse return null,
         .browse_id = txt.sanitizeDupe(arena, browse_id_str) orelse return null,
         .title = txt.sanitizeDupe(arena, title) orelse return null,
         .artist = txt.sanitizeDupe(arena, artist) orelse return null,
+        .album = txt.sanitizeDupe(arena, album) orelse "",
+        .duration_s = durationOf(obj),
         .kind = txt.sanitizeDupe(arena, kind) orelse return null,
     };
 }
@@ -176,7 +206,7 @@ pub fn browseAlbum(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io,
 
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, resp, .{});
     var out: std.ArrayList(Track) = .empty;
-    try collectTracks(arena, parsed.value, &out, 256);
+    try collectTracks(arena, parsed.value, &out, 256, "");
     if (out.items.len == 0) return error.NoResult;
 
     if (findAlbumArtist(parsed.value)) |alb| {
@@ -186,6 +216,46 @@ pub fn browseAlbum(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io,
         }
     }
     return out.toOwnedSlice(arena);
+}
+
+/// Songs put the runtime in a fixedColumn, videos in the subtitle; an unparseable one means unknown.
+fn durationOf(obj: std.json.ObjectMap) u32 {
+    if (obj.get("fixedColumns")) |fixed| {
+        if (fixed == .array) {
+            for (fixed.array.items) |col| {
+                if (col != .object) continue;
+                const inner = col.object.get("musicResponsiveListItemFixedColumnRenderer") orelse continue;
+                if (inner != .object) continue;
+                const text = inner.object.get("text") orelse continue;
+                if (text != .object) continue;
+                const runs = text.object.get("runs") orelse continue;
+                if (runs != .array or runs.array.items.len == 0) continue;
+                if (textOfRun(runs.array.items[0])) |t| {
+                    if (looksLikeDuration(t)) return track_mod.parseDuration(t);
+                }
+            }
+        }
+    }
+    const flex = obj.get("flexColumns") orelse return 0;
+    if (flex != .array) return 0;
+    for (flex.array.items) |col| {
+        const runs = flexRuns(col) orelse continue;
+        for (runs) |run| {
+            if (textOfRun(run)) |t| {
+                if (looksLikeDuration(t)) return track_mod.parseDuration(t);
+            }
+        }
+    }
+    return 0;
+}
+
+/// Album browse ids are the MPRE namespace; matching that beats guessing by run position.
+fn albumOfRuns(runs: []std.json.Value) ?[]const u8 {
+    for (runs) |run| {
+        const bid = browseIdOfRun(run) orelse continue;
+        if (std.mem.startsWith(u8, bid, "MPRE")) return textOfRun(run);
+    }
+    return null;
 }
 
 fn isKindWord(s: []const u8) bool {
@@ -220,10 +290,21 @@ fn firstLinkedRunText(runs: []std.json.Value) ?[]const u8 {
     return null;
 }
 
+/// Positional fallback that skips kind words, separators and runtimes — top-result rows have no artist run at all.
 fn positionalArtist(runs: []std.json.Value) ?[]const u8 {
-    if (runs.len >= 3) return textOfRun(runs[2]);
-    if (runs.len >= 1) return textOfRun(runs[0]);
+    for (runs) |run| {
+        const t = textOfRun(run) orelse continue;
+        if (isKindWord(t)) continue;
+        if (looksLikeDuration(t)) continue;
+        if (std.mem.trim(u8, t, " \t•·-—").len == 0) continue;
+        return t;
+    }
     return null;
+}
+
+/// Requires the colon: "1979" is a plausible name, only m:ss is unambiguously a runtime.
+fn looksLikeDuration(t: []const u8) bool {
+    return std.mem.indexOfScalar(u8, t, ':') != null and track_mod.parseDuration(t) > 0;
 }
 
 fn findAlbumArtist(v: std.json.Value) ?[]const u8 {
@@ -313,9 +394,7 @@ fn buildBodyFiltered(arena: std.mem.Allocator, query: []const u8, filter: Filter
     return std.fmt.allocPrint(arena, "{{{s},\"query\":{s},\"params\":\"{s}\"}}", .{ CLIENT_CONTEXT, escaped, params });
 }
 
-/// POST a JSON body to an InnerTube endpoint. The body goes through a 0600 temp file
-/// rather than an argv entry: queries are user text and would otherwise be visible in
-/// the process list of every other user on the machine.
+/// Body goes through a 0600 temp file, never argv: queries are user text and argv is world-readable.
 fn postJson(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, url: []const u8, body: []const u8) ![]u8 {
     const body_path = try writeTempFile(arena, body);
     defer _ = c.unlink(body_path.ptr);
@@ -399,7 +478,7 @@ test "collectTracks extracts a song from an InnerTube fixture" {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
     var out: std.ArrayList(Track) = .empty;
-    try collectTracks(a, parsed.value, &out, 10);
+    try collectTracks(a, parsed.value, &out, 10, "");
 
     try testing.expectEqual(@as(usize, 1), out.items.len);
     const t = out.items[0];
@@ -449,4 +528,131 @@ test "findAlbumArtist reads legacy musicDetailHeaderRenderer subtitle" {
         "Bohren & der Club of Gore",
         findAlbumArtist(parsed.value).?,
     );
+}
+
+test "a subtitle of `Song • 5:38` yields no artist and a duration" {
+    // top-result song rows carry no artist run at all
+    const json =
+        \\{"musicResponsiveListItemRenderer":{
+        \\  "playlistItemData":{"videoId":"abc123"},
+        \\  "flexColumns":[
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Instant Crush"}]}}},
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+        \\      {"text":"Song"},{"text":" • "},{"text":"5:38"}
+        \\    ]}}},
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"1.2B plays"}]}}}
+        \\  ]
+        \\}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    const t = extractTrack(a, parsed.value.object.get("musicResponsiveListItemRenderer").?, "").?;
+    try testing.expectEqualStrings("unknown", t.artist);
+    try testing.expectEqualStrings("Song", t.kind);
+    try testing.expectEqual(@as(u32, 338), t.duration_s);
+}
+
+test "duration parsing never claims a numeric title is a runtime" {
+    try testing.expect(looksLikeDuration("5:38"));
+    try testing.expect(!looksLikeDuration("1979"));
+    try testing.expect(!looksLikeDuration("1.2B plays"));
+    try testing.expect(!looksLikeDuration("Song"));
+}
+
+test "extractTrack keeps a linked artist and picks up album and duration" {
+    const json =
+        \\{"musicResponsiveListItemRenderer":{
+        \\  "playlistItemData":{"videoId":"abc123"},
+        \\  "flexColumns":[
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Midnight"}]}}},
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+        \\      {"text":"Song"},{"text":" • "},
+        \\      {"text":"Bohren","navigationEndpoint":{"browseEndpoint":{"browseId":"UCbohren"}}},
+        \\      {"text":" • "},
+        \\      {"text":"Black Earth","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREblack"}}},
+        \\      {"text":" • "},{"text":"3:42"}
+        \\    ]}}}
+        \\  ]
+        \\}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    const t = extractTrack(a, parsed.value.object.get("musicResponsiveListItemRenderer").?, "").?;
+    try testing.expectEqualStrings("Bohren", t.artist);
+    try testing.expectEqualStrings("Black Earth", t.album);
+    try testing.expectEqual(@as(u32, 222), t.duration_s);
+    try testing.expectEqual(track_mod.Source.youtube, t.source);
+}
+
+test "card-shelf rows inherit the artist the card header names" {
+    // the card header carries the artist its rows omit
+    const json =
+        \\{"musicCardShelfRenderer":{
+        \\  "title":{"runs":[{"text":"Daft Punk","navigationEndpoint":{"browseEndpoint":{"browseId":"UCRr1"}}}]},
+        \\  "subtitle":{"runs":[{"text":"Artist"},{"text":" • "},{"text":"80.5M monthly audience"}]},
+        \\  "contents":[{"musicResponsiveListItemRenderer":{
+        \\    "playlistItemData":{"videoId":"abc123"},
+        \\    "flexColumns":[
+        \\      {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Instant Crush"}]}}},
+        \\      {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+        \\        {"text":"Song"},{"text":" • "},{"text":"5:38"}
+        \\      ]}}}
+        \\    ]
+        \\  }}]
+        \\}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    var out: std.ArrayList(Track) = .empty;
+    try collectTracks(a, parsed.value, &out, 10, "");
+
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqualStrings("Daft Punk", out.items[0].artist);
+    try testing.expectEqual(@as(u32, 338), out.items[0].duration_s);
+}
+
+test "cardArtist reads a linked subtitle when the card title is not the artist" {
+    const json =
+        \\{"title":{"runs":[{"text":"Daft Punk - One More Time (Official Video)"}]},
+        \\ "subtitle":{"runs":[
+        \\   {"text":"Video"},{"text":" • "},
+        \\   {"text":"Daft Punk","navigationEndpoint":{"browseEndpoint":{"browseId":"UC_kR"}}},
+        \\   {"text":" • "},{"text":"614M views"}
+        \\ ]}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    try testing.expectEqualStrings("Daft Punk", cardArtist(parsed.value).?);
+}
+
+test "a row with its own artist ignores the inherited one" {
+    const json =
+        \\{"musicResponsiveListItemRenderer":{
+        \\  "playlistItemData":{"videoId":"abc123"},
+        \\  "flexColumns":[
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Song Title"}]}}},
+        \\    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+        \\      {"text":"Song"},{"text":" • "},
+        \\      {"text":"Real Artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCreal"}}}
+        \\    ]}}}
+        \\  ]
+        \\}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    const t = extractTrack(a, parsed.value.object.get("musicResponsiveListItemRenderer").?, "Card Artist").?;
+    try testing.expectEqualStrings("Real Artist", t.artist);
 }

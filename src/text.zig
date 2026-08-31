@@ -1,10 +1,6 @@
 const std = @import("std");
 
-/// Text from YouTube (titles, artists, autocomplete) is drawn straight into a raw-mode
-/// terminal and written into the tab/newline-delimited history and playlist files, so a
-/// title is untrusted input on both counts. Control bytes become spaces (no cursor moves,
-/// no colour changes, no forged rows) and malformed UTF-8 is dropped before it can reach
-/// the column math.
+/// Remote text reaches a raw-mode terminal and tab-delimited files: control bytes become spaces, malformed UTF-8 is dropped.
 pub fn sanitize(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(arena, s.len);

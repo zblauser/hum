@@ -3,8 +3,7 @@ const log = @import("log.zig");
 
 pub const Error = error{ProcFailed} || std.process.RunError;
 
-/// A remote endpoint decides how much these subprocesses print, so cap what we are
-/// willing to buffer instead of following curl or yt-dlp into an OOM.
+/// A remote endpoint decides how much these print, so cap what we buffer.
 const STDOUT_LIMIT = 32 * 1024 * 1024;
 const STDERR_LIMIT = 64 * 1024;
 

@@ -10,8 +10,7 @@ pub fn fetch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, query
     if (query.len == 0) return &.{};
 
     const escaped = try urlEscape(arena, query);
-    // ie/oe are not optional: without them the endpoint answers in latin-1, and the
-    // raw high bytes land in the TUI as invalid UTF-8
+    // ie/oe are not optional: without them the endpoint answers in latin-1
     const url = try std.fmt.allocPrint(
         arena,
         "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&ie=utf-8&oe=utf-8&q={s}",

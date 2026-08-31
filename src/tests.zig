@@ -1,6 +1,4 @@
-// Test aggregator root. `zig build test` compiles this; referencing each module
-// with `_ = @import(...)` forces its colocated `test` blocks to be included
-// (importing a module for its functions alone does not pull in its tests).
+// Test aggregator: importing a module here pulls in its colocated tests.
 test {
     _ = @import("theme.zig");
     _ = @import("history.zig");
@@ -11,4 +9,9 @@ test {
     _ = @import("ui.zig");
     _ = @import("log.zig");
     _ = @import("text.zig");
+    _ = @import("track.zig");
+    _ = @import("tags.zig");
+    _ = @import("library.zig");
+    _ = @import("feed.zig");
+    _ = @import("stream.zig");
 }
