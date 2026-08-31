@@ -55,6 +55,20 @@ pub fn build(b: *std.Build) void {
 /// on any machine instead of at tag time in a VM.
 fn addCheckStep(b: *std.Build, mpv_prefix: []const u8, options: *std.Build.Step.Options) void {
     const check = b.step("check", "Type-check all release targets (no link)");
+
+    // Zig ships libc headers for every target below, so the ONLY header this
+    // needs from the host is mpv/client.h. Copy that one file into a generated
+    // directory rather than putting a system include path on the command line:
+    // -I /usr/include would feed the host's glibc headers to a macOS or FreeBSD
+    // cross-compile, which fails on glibc internals.
+    const header = findMpvHeader(b, mpv_prefix) orelse {
+        std.log.warn("check: mpv/client.h not found; skipping (pass -Dmpv-prefix)", .{});
+        return;
+    };
+    const shim = b.addWriteFiles();
+    _ = shim.addCopyFile(.{ .cwd_relative = header }, "mpv/client.h");
+    const include_dir = shim.getDirectory();
+
     const targets = [_][]const u8{
         "x86_64-freebsd",
         "x86_64-linux-gnu",
@@ -75,9 +89,7 @@ fn addCheckStep(b: *std.Build, mpv_prefix: []const u8, options: *std.Build.Step.
                 .optimize = mode,
                 .link_libc = true,
             });
-            for (mpvIncludeDirs(b, mpv_prefix)) |dir| {
-                mod.addIncludePath(.{ .cwd_relative = dir });
-            }
+            mod.addIncludePath(include_dir);
             mod.addOptions("build_options", options);
             const obj = b.addObject(.{
                 .name = b.fmt("check-{s}-{s}", .{ triple, @tagName(mode) }),
@@ -88,28 +100,21 @@ fn addCheckStep(b: *std.Build, mpv_prefix: []const u8, options: *std.Build.Step.
     }
 }
 
-/// Where mpv/client.h might live. The check step only needs the header, and it
-/// runs on whatever machine or runner invokes it: Homebrew uses /usr/local or
-/// /opt/homebrew, Debian's libmpv-dev uses /usr/include.
-fn mpvIncludeDirs(b: *std.Build, prefix: []const u8) []const []const u8 {
-    var found: std.ArrayList([]const u8) = .empty;
-    const candidates = [_][]const u8{
+/// Locate mpv/client.h: the configured prefix, then the usual system locations.
+fn findMpvHeader(b: *std.Build, prefix: []const u8) ?[]const u8 {
+    const dirs = [_][]const u8{
         if (prefix.len > 0) b.fmt("{s}/include", .{prefix}) else "",
         "/usr/include",
         "/usr/local/include",
         "/opt/homebrew/include",
     };
-    for (candidates) |dir| {
+    for (dirs) |dir| {
         if (dir.len == 0) continue;
-        const header = b.fmt("{s}/mpv/client.h", .{dir});
-        std.Io.Dir.cwd().access(b.graph.io, header, .{}) catch continue;
-        found.append(b.allocator, dir) catch continue;
+        const path = b.fmt("{s}/mpv/client.h", .{dir});
+        std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch continue;
+        return path;
     }
-    if (found.items.len == 0) {
-        std.log.warn("check: mpv/client.h not found; install libmpv headers or pass -Dmpv-prefix", .{});
-        if (prefix.len > 0) return b.allocator.dupe([]const u8, &.{b.fmt("{s}/include", .{prefix})}) catch &.{};
-    }
-    return found.toOwnedSlice(b.allocator) catch &.{};
+    return null;
 }
 
 fn linkMpv(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {
