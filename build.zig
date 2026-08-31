@@ -75,7 +75,9 @@ fn addCheckStep(b: *std.Build, mpv_prefix: []const u8, options: *std.Build.Step.
                 .optimize = mode,
                 .link_libc = true,
             });
-            mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{if (mpv_prefix.len > 0) mpv_prefix else "/usr/local"}) });
+            for (mpvIncludeDirs(b, mpv_prefix)) |dir| {
+                mod.addIncludePath(.{ .cwd_relative = dir });
+            }
             mod.addOptions("build_options", options);
             const obj = b.addObject(.{
                 .name = b.fmt("check-{s}-{s}", .{ triple, @tagName(mode) }),
@@ -84,6 +86,30 @@ fn addCheckStep(b: *std.Build, mpv_prefix: []const u8, options: *std.Build.Step.
             check.dependOn(&obj.step);
         }
     }
+}
+
+/// Where mpv/client.h might live. The check step only needs the header, and it
+/// runs on whatever machine or runner invokes it: Homebrew uses /usr/local or
+/// /opt/homebrew, Debian's libmpv-dev uses /usr/include.
+fn mpvIncludeDirs(b: *std.Build, prefix: []const u8) []const []const u8 {
+    var found: std.ArrayList([]const u8) = .empty;
+    const candidates = [_][]const u8{
+        if (prefix.len > 0) b.fmt("{s}/include", .{prefix}) else "",
+        "/usr/include",
+        "/usr/local/include",
+        "/opt/homebrew/include",
+    };
+    for (candidates) |dir| {
+        if (dir.len == 0) continue;
+        const header = b.fmt("{s}/mpv/client.h", .{dir});
+        std.Io.Dir.cwd().access(b.graph.io, header, .{}) catch continue;
+        found.append(b.allocator, dir) catch continue;
+    }
+    if (found.items.len == 0) {
+        std.log.warn("check: mpv/client.h not found; install libmpv headers or pass -Dmpv-prefix", .{});
+        if (prefix.len > 0) return b.allocator.dupe([]const u8, &.{b.fmt("{s}/include", .{prefix})}) catch &.{};
+    }
+    return found.toOwnedSlice(b.allocator) catch &.{};
 }
 
 fn linkMpv(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {
