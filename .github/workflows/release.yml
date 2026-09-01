@@ -42,10 +42,14 @@ jobs:
 
   # Single universal (arm64 + x86_64) binary, cross-built on one Apple-silicon
   # runner and lipo'd — avoids the scarce macos-13 Intel runner entirely.
+  # Apple-silicon only. The universal build died when Homebrew stopped
+  # shipping x86_64 bottles for mpv (Tier 3 under Rosetta): the x86_64 slice
+  # needs an x86_64 libmpv to link against, and building mpv from source in CI
+  # means building ffmpeg too. Intel Macs build from source via the tap.
   build-macos:
-    name: macos-universal
+    name: macos-arm64
     runs-on: macos-14
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -53,38 +57,22 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: install libmpv (arm64, native)
+      - name: install libmpv
         run: brew install mpv
 
-      - name: install libmpv (x86_64, via Rosetta homebrew)
+      - name: build
         run: |
-          sudo softwareupdate --install-rosetta --agree-to-license
-          arch -x86_64 /usr/bin/env NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          # mpv's python@3.14 dep can fail to symlink into /usr/local/bin against
-          # the runner's preinstalled Python.framework — harmless, we only need
-          # libmpv, reached via the formula's opt prefix (not global links).
-          arch -x86_64 /usr/local/bin/brew install mpv || true
-          test -f "$(arch -x86_64 /usr/local/bin/brew --prefix mpv)/lib/libmpv.dylib"
-
-      - name: build both slices + lipo
-        run: |
-          ARM_MPV="$(brew --prefix mpv)"
-          X86_MPV="$(arch -x86_64 /usr/local/bin/brew --prefix mpv)"
-          zig build test -Dmpv-prefix="$ARM_MPV"
-          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dmpv-prefix="$ARM_MPV"
-          cp zig-out/bin/hum hum-arm64
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos -Dmpv-prefix="$X86_MPV"
-          cp zig-out/bin/hum hum-x86_64
-          lipo -create -output hum hum-arm64 hum-x86_64
-          lipo -info hum
-          file hum
+          MPV="$(brew --prefix mpv)"
+          zig build test -Dmpv-prefix="$MPV"
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dmpv-prefix="$MPV"
+          file zig-out/bin/hum
 
       - name: package
-        run: tar -czf hum-macos-universal.tar.gz hum
+        run: tar -czf hum-macos-arm64.tar.gz -C zig-out/bin hum
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: hum-macos-universal.tar.gz
+          files: hum-macos-arm64.tar.gz
 
   # Everything here runs inside an emulated FreeBSD VM, so every step is
   # 5-10x its native cost. The 30-minute cap was being hit; the work was
