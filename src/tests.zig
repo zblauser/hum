@@ -1,4 +1,3 @@
-// Test aggregator: importing a module here pulls in its colocated tests.
 test {
     _ = @import("theme.zig");
     _ = @import("history.zig");
@@ -14,4 +13,5 @@ test {
     _ = @import("library.zig");
     _ = @import("feed.zig");
     _ = @import("stream.zig");
+    _ = @import("vis.zig");
 }

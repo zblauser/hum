@@ -4,19 +4,16 @@ const txt = @import("text.zig");
 const fsutil = @import("fsutil.zig");
 const track_mod = @import("track.zig");
 
-// Public WEB_REMIX client key, served in every YouTube Music page. Not a secret; secret scanners flag it by pattern.
 const INNERTUBE_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 const SEARCH_URL = "https://music.youtube.com/youtubei/v1/search?key=" ++ INNERTUBE_KEY ++ "&prettyPrint=false";
-const TMP_TEMPLATE = "/tmp/hum_bodyXXXXXX";
 
-// Embedded verbatim into request bodies, so format strings add only the surrounding object.
 const CLIENT_CONTEXT =
     \\"context":{"client":{"clientName":"WEB_REMIX","clientVersion":"1.20240101.00.00","hl":"en","gl":"US"},"user":{}}
 ;
 
 const c = fsutil.c;
+const SEARCH_TIMEOUT_S = "20";
 
-// Track is not an api type; re-exported so `api.Track` references keep working.
 pub const Track = track_mod.Track;
 pub const Source = track_mod.Source;
 
@@ -78,7 +75,6 @@ pub fn searchFiltered(
     return out.toOwnedSlice(arena);
 }
 
-/// Rows inside a card shelf drop the artist from their subtitle because the card header carries it.
 fn collectTracks(
     arena: std.mem.Allocator,
     v: std.json.Value,
@@ -114,7 +110,6 @@ fn collectTracks(
     }
 }
 
-/// The card's artist is the first UC-linked run in its title, else in its subtitle.
 fn cardArtist(card: std.json.Value) ?[]const u8 {
     if (card != .object) return null;
     inline for (.{ "title", "subtitle" }) |key| {
@@ -218,7 +213,6 @@ pub fn browseAlbum(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io,
     return out.toOwnedSlice(arena);
 }
 
-/// Songs put the runtime in a fixedColumn, videos in the subtitle; an unparseable one means unknown.
 fn durationOf(obj: std.json.ObjectMap) u32 {
     if (obj.get("fixedColumns")) |fixed| {
         if (fixed == .array) {
@@ -249,7 +243,6 @@ fn durationOf(obj: std.json.ObjectMap) u32 {
     return 0;
 }
 
-/// Album browse ids are the MPRE namespace; matching that beats guessing by run position.
 fn albumOfRuns(runs: []std.json.Value) ?[]const u8 {
     for (runs) |run| {
         const bid = browseIdOfRun(run) orelse continue;
@@ -290,7 +283,6 @@ fn firstLinkedRunText(runs: []std.json.Value) ?[]const u8 {
     return null;
 }
 
-/// Positional fallback that skips kind words, separators and runtimes — top-result rows have no artist run at all.
 fn positionalArtist(runs: []std.json.Value) ?[]const u8 {
     for (runs) |run| {
         const t = textOfRun(run) orelse continue;
@@ -302,7 +294,6 @@ fn positionalArtist(runs: []std.json.Value) ?[]const u8 {
     return null;
 }
 
-/// Requires the colon: "1979" is a plausible name, only m:ss is unambiguously a runtime.
 fn looksLikeDuration(t: []const u8) bool {
     return std.mem.indexOfScalar(u8, t, ':') != null and track_mod.parseDuration(t) > 0;
 }
@@ -394,35 +385,20 @@ fn buildBodyFiltered(arena: std.mem.Allocator, query: []const u8, filter: Filter
     return std.fmt.allocPrint(arena, "{{{s},\"query\":{s},\"params\":\"{s}\"}}", .{ CLIENT_CONTEXT, escaped, params });
 }
 
-/// Body goes through a 0600 temp file, never argv: queries are user text and argv is world-readable.
 fn postJson(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, url: []const u8, body: []const u8) ![]u8 {
-    const body_path = try writeTempFile(arena, body);
+    const body_path = try fsutil.makeTemp(arena, "hum_body", body);
     defer _ = c.unlink(body_path.ptr);
     const data_arg = try std.fmt.allocPrint(arena, "@{s}", .{body_path});
 
     return proc.runCapture(gpa, io, &.{
         "curl",          "-sS",
-        "--max-time",    "20",
+        "--max-time",    SEARCH_TIMEOUT_S,
         "-H",            "Content-Type: application/json",
         "-H",            "User-Agent: Mozilla/5.0",
         "-X",            "POST",
         "--data-binary", data_arg,
         url,
     });
-}
-
-fn writeTempFile(arena: std.mem.Allocator, body: []const u8) ![:0]const u8 {
-    const path = try arena.dupeZ(u8, TMP_TEMPLATE);
-    const fd = c.mkstemp(path.ptr);
-    if (fd < 0) return error.TempFileOpen;
-    defer _ = c.close(fd);
-    var off: usize = 0;
-    while (off < body.len) {
-        const n = c.write(fd, body[off..].ptr, body.len - off);
-        if (n <= 0) return error.TempFileWrite;
-        off += @intCast(n);
-    }
-    return path;
 }
 
 const testing = std.testing;
@@ -531,7 +507,6 @@ test "findAlbumArtist reads legacy musicDetailHeaderRenderer subtitle" {
 }
 
 test "a subtitle of `Song • 5:38` yields no artist and a duration" {
-    // top-result song rows carry no artist run at all
     const json =
         \\{"musicResponsiveListItemRenderer":{
         \\  "playlistItemData":{"videoId":"abc123"},
@@ -591,7 +566,6 @@ test "extractTrack keeps a linked artist and picks up album and duration" {
 }
 
 test "card-shelf rows inherit the artist the card header names" {
-    // the card header carries the artist its rows omit
     const json =
         \\{"musicCardShelfRenderer":{
         \\  "title":{"runs":[{"text":"Daft Punk","navigationEndpoint":{"browseEndpoint":{"browseId":"UCRr1"}}}]},

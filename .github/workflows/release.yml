@@ -8,46 +8,8 @@ permissions:
   contents: write
 
 jobs:
-  build-linux:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-arm64,  os: ubuntu-24.04-arm }
-          - { name: linux-x86_64, os: ubuntu-24.04 }
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: install libmpv
-        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
-
-      - name: build
-        run: |
-          zig build test -Dmpv-prefix=
-          zig build -Doptimize=ReleaseSafe -Dmpv-prefix=
-
-      - name: package
-        run: tar -czf "hum-${{ matrix.name }}.tar.gz" -C zig-out/bin hum
-
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: hum-${{ matrix.name }}.tar.gz
-
-  # Single universal (arm64 + x86_64) binary, cross-built on one Apple-silicon
-  # runner and lipo'd — avoids the scarce macos-13 Intel runner entirely.
-  # Apple-silicon only. The universal build died when Homebrew stopped
-  # shipping x86_64 bottles for mpv (Tier 3 under Rosetta): the x86_64 slice
-  # needs an x86_64 libmpv to link against, and building mpv from source in CI
-  # means building ffmpeg too. Intel Macs build from source via the tap.
-  build-macos:
-    name: macos-arm64
+  build:
+    name: all targets
     runs-on: macos-14
     timeout-minutes: 30
     steps:
@@ -55,74 +17,30 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
-      - name: install libmpv
-        run: brew install mpv
+      - name: test
+        run: zig build test
 
       - name: build
         run: |
-          MPV="$(brew --prefix mpv)"
-          zig build test -Dmpv-prefix="$MPV"
-          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dmpv-prefix="$MPV"
-          file zig-out/bin/hum
+          set -e
+          for t in aarch64-macos x86_64-macos x86_64-linux-gnu aarch64-linux-gnu x86_64-freebsd; do
+            zig build -Doptimize=ReleaseSafe -Dtarget=$t --prefix out/$t
+          done
+          mkdir -p out/macos-universal/bin
+          lipo -create -output out/macos-universal/bin/hum out/aarch64-macos/bin/hum out/x86_64-macos/bin/hum
+          file out/*/bin/hum
 
       - name: package
-        run: tar -czf hum-macos-arm64.tar.gz -C zig-out/bin hum
+        run: |
+          set -e
+          pack() { tar -czf "hum-$1.tar.gz" -C "out/$2/bin" hum; }
+          pack macos-universal macos-universal
+          pack linux-x86_64 x86_64-linux-gnu
+          pack linux-arm64 aarch64-linux-gnu
+          pack freebsd-x86_64 x86_64-freebsd
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: hum-macos-arm64.tar.gz
-
-  # Everything here runs inside an emulated FreeBSD VM, so every step is
-  # 5-10x its native cost. The 30-minute cap was being hit; the work was
-  # a 55MB in-VM toolchain download plus two full compiles.
-  build-freebsd:
-    name: freebsd-x86_64
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-
-      # Pull the toolchain on the fast host (and cache it between releases)
-      # instead of over the VM's emulated network. The VM sees the workspace.
-      - name: cache zig tarball
-        id: zigcache
-        uses: actions/cache@v4
-        with:
-          path: zig-freebsd.tar.xz
-          key: zig-freebsd-0.16.0
-
-      - name: fetch zig (host)
-        if: steps.zigcache.outputs.cache-hit != 'true'
-        run: curl -fsSL -o zig-freebsd.tar.xz "https://ziglang.org/download/0.16.0/zig-x86_64-freebsd-0.16.0.tar.xz"
-
-      - uses: vmactions/freebsd-vm@v1
-        with:
-          usesh: true
-          prepare: |
-            set -e
-            # mpv drags in ffmpeg/X11/vulkan; we only ever link libmpv, but the
-            # port is how FreeBSD ships it. Keep the set otherwise minimal.
-            pkg install -y mpv pkgconf curl
-          run: |
-            set -e
-            # Unpacked here rather than in `prepare`: this block is the one that
-            # is guaranteed to run inside the synced workspace, where the
-            # host-fetched tarball actually is.
-            mkdir -p /opt/zig
-            tar -xJf zig-freebsd.tar.xz -C /opt/zig --strip-components=1
-            ln -sf /opt/zig/zig /usr/local/bin/zig
-            zig version
-            # Tests already run on the linux and macos legs of this same
-            # workflow. Repeating them here bought a second full compile in the
-            # slowest environment we have, for no extra coverage.
-            zig build -Doptimize=ReleaseSafe -Dmpv-prefix=/usr/local
-
-      - name: package
-        run: tar -czf hum-freebsd-x86_64.tar.gz -C zig-out/bin hum
-
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: hum-freebsd-x86_64.tar.gz
+          files: hum-*.tar.gz

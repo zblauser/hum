@@ -4,10 +4,8 @@ const track_mod = @import("track.zig");
 const fsutil = @import("fsutil.zig");
 const proc = @import("proc.zig");
 
-/// One playable episode from a feed.
 pub const Episode = struct {
     title: []const u8,
-    /// The enclosure. Always http(s) — see `validUrl`.
     url: []const u8,
     published: []const u8 = "",
     duration_s: u32 = 0,
@@ -18,14 +16,13 @@ pub const Feed = struct {
     episodes: []Episode = &.{},
 };
 
-// A feed is a stranger's XML; these are the ceilings it cannot exceed.
 pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 500;
 const MAX_TEXT: usize = 512;
 const MAX_URL: usize = 2048;
 const MAX_ENTITY: usize = 12;
+const FETCH_TIMEOUT_S = "25";
 
-/// Deliberately not a general XML parser: it scans for the few elements a feed must have and ignores the rest. No DTDs, entity definitions, namespaces, recursion or external references, so expansion bombs have nothing to expand.
 pub fn parse(arena: std.mem.Allocator, bytes: []const u8) ?Feed {
     if (bytes.len == 0 or bytes.len > MAX_BYTES) return null;
     const is_rss = std.mem.indexOf(u8, bytes, "<item") != null;
@@ -38,7 +35,6 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) ?Feed {
     var out: std.ArrayList(Episode) = .empty;
     var feed_title: []const u8 = "";
 
-    // the channel title precedes the first item
     const first_item = std.mem.indexOf(u8, bytes, open) orelse return null;
     if (tagText(bytes[0..first_item], "title")) |t| {
         feed_title = clean(arena, t) orelse "";
@@ -76,7 +72,6 @@ fn episodeOf(arena: std.mem.Allocator, chunk: []const u8) ?Episode {
     return ep;
 }
 
-/// RSS uses <enclosure url>; Atom uses a link with rel="enclosure" or an audio type.
 fn enclosureUrl(chunk: []const u8) ?[]const u8 {
     if (findTag(chunk, "<enclosure")) |tag| {
         if (attr(tag, "url")) |u| return u;
@@ -113,13 +108,11 @@ fn findTag(hay: []const u8, name: []const u8) ?[]const u8 {
     return f.tag;
 }
 
-/// name="value" or name='value', bounded. Returns a slice of `tag`.
 fn attr(tag: []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < tag.len) {
         const at = std.mem.indexOfPos(u8, tag, i, name) orelse return null;
         i = at + name.len;
-        // must be a whole attribute name, not a suffix of another
         if (at == 0 or (tag[at - 1] != ' ' and tag[at - 1] != '\t')) continue;
         var j = i;
         while (j < tag.len and (tag[j] == ' ' or tag[j] == '\t')) j += 1;
@@ -137,7 +130,6 @@ fn attr(tag: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Text of the first <name> element, CDATA unwrapped. Never crosses into a nested element.
 fn tagText(hay: []const u8, name: []const u8) ?[]const u8 {
     var buf: [64]u8 = undefined;
     if (name.len + 2 > buf.len) return null;
@@ -146,10 +138,9 @@ fn tagText(hay: []const u8, name: []const u8) ?[]const u8 {
     var from: usize = 0;
     while (findTagPos(hay, open, from)) |found| {
         from = found.end;
-        // "<title" must not match "<titleFoo"
         const after = found.tag[open.len..];
         if (after.len > 0 and after[0] != ' ' and after[0] != '\t' and after[0] != '/') continue;
-        if (std.mem.endsWith(u8, found.tag, "/")) continue; // self-closing: no text
+        if (std.mem.endsWith(u8, found.tag, "/")) continue;
 
         var close_buf: [64]u8 = undefined;
         const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{name}) catch return null;
@@ -167,7 +158,6 @@ fn tagText(hay: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Only the five predefined entities and bounded numeric refs; definitions are never looked up.
 fn decodeEntities(arena: std.mem.Allocator, s: []const u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
     var out: std.ArrayList(u8) = .empty;
@@ -221,14 +211,12 @@ fn decodeEntities(arena: std.mem.Allocator, s: []const u8) ?[]const u8 {
                 } else |_| {}
             } else |_| {}
         }
-        // unknown entity: keep the text, expand nothing
         out.append(arena, s[i]) catch return null;
         i += 1;
     }
     return out.items;
 }
 
-/// Decode, sanitize, cap: feed text is remote text like any other.
 fn clean(arena: std.mem.Allocator, s: []const u8) ?[]const u8 {
     const decoded = decodeEntities(arena, s) orelse return null;
     const safe = txt.sanitize(arena, decoded) catch return null;
@@ -240,7 +228,6 @@ fn clean(arena: std.mem.Allocator, s: []const u8) ?[]const u8 {
     return trimmed[0..end];
 }
 
-/// Handed to mpv, so http(s) only — never a path, a scheme, or anything quotable.
 pub fn validUrl(u: []const u8) bool {
     if (u.len == 0 or u.len > MAX_URL) return false;
     if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) return false;
@@ -251,13 +238,11 @@ pub fn validUrl(u: []const u8) bool {
     return true;
 }
 
-/// `<itunes:duration>` is seconds, or mm:ss, or hh:mm:ss.
 fn parseDuration(s: []const u8) u32 {
     if (std.mem.indexOfScalar(u8, s, ':') != null) return track_mod.parseDuration(s);
     return std.fmt.parseInt(u32, s, 10) catch 0;
 }
 
-/// Episode → queue row.
 pub fn toTrack(ep: Episode, feed_title: []const u8) track_mod.Track {
     return .{
         .source = .url,
@@ -271,10 +256,8 @@ pub fn toTrack(ep: Episode, feed_title: []const u8) track_mod.Track {
 
 // --------------------------------------------------------- subscriptions
 
-/// One subscribed feed: the URL we fetch and the title it reported.
 pub const Sub = struct { url: []const u8, title: []const u8 = "" };
 
-/// $XDG_DATA_HOME/hum/feeds — data worth keeping, so not the cache.
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]const u8 {
     return fsutil.xdgPath(arena, env, "XDG_DATA_HOME", ".local/share", "feeds");
 }
@@ -288,7 +271,7 @@ pub fn loadSubs(arena: std.mem.Allocator, file_path: []const u8) []Sub {
         if (line.len == 0 or line[0] == '#') continue;
         var f = std.mem.splitScalar(u8, line, '\t');
         const url = f.next() orelse continue;
-        if (!validUrl(url)) continue; // a hand-edited file is still input
+        if (!validUrl(url)) continue;
         const title = f.next() orelse "";
         out.append(arena, .{ .url = url, .title = title }) catch return out.items;
     }
@@ -304,15 +287,14 @@ pub fn saveSubs(arena: std.mem.Allocator, file_path: []const u8, subs: []const S
     return fsutil.writeFile(arena, file_path, buf.items);
 }
 
-/// Redirects followed (feed hosts move), time-boxed, size-capped, URL validated before argv.
 pub fn fetch(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
     if (!validUrl(url)) return error.BadUrl;
     return proc.runCapture(gpa, io, &.{
-        "curl",          "-sSL",
-        "--max-time",    "25",
-        "--max-filesize", "16777216",
-        "-H",            "User-Agent: hum/podcast",
-        "--",            url,
+        "curl",           "-sSL",
+        "--max-time",     FETCH_TIMEOUT_S,
+        "--max-filesize", std.fmt.comptimePrint("{d}", .{MAX_BYTES}),
+        "-H",             "User-Agent: hum/podcast",
+        "--",             url,
     });
 }
 
@@ -351,7 +333,7 @@ test "rss: channel title, episodes, entities, CDATA, durations" {
     try testing.expect(f.episodes[0].published.len > 0);
 
     try testing.expectEqualStrings("Episode Two <with> markup", f.episodes[1].title);
-    try testing.expectEqual(@as(u32, 95), f.episodes[1].duration_s); // bare seconds
+    try testing.expectEqual(@as(u32, 95), f.episodes[1].duration_s);
 }
 
 test "atom entries with an audio link" {
@@ -397,7 +379,7 @@ test "hostile URLs never reach the player" {
     try testing.expect(!validUrl("javascript:alert(1)"));
     try testing.expect(!validUrl("file:///etc/passwd"));
     try testing.expect(!validUrl("/etc/passwd"));
-    try testing.expect(!validUrl("https://example.com/a b.mp3")); // space
+    try testing.expect(!validUrl("https://example.com/a b.mp3"));
     try testing.expect(!validUrl("https://example.com/\"quoted\".mp3"));
     try testing.expect(!validUrl("https://example.com/\x00.mp3"));
     try testing.expect(!validUrl(""));
@@ -420,7 +402,6 @@ test "entity bombs expand to nothing because definitions are never read" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // billion-laughs shape plus an external-entity attempt
     const feed =
         \\<?xml version="1.0"?>
         \\<!DOCTYPE rss [
@@ -434,7 +415,6 @@ test "entity bombs expand to nothing because definitions are never read" {
     ;
     const f = parse(a, feed).?;
     try testing.expectEqual(@as(usize, 1), f.episodes.len);
-    // references survive as literal text; nothing was expanded or fetched
     try testing.expectEqualStrings("&lol2; &xxe;", f.episodes[0].title);
 }
 
@@ -469,7 +449,6 @@ test "junk, truncation and absurd size are all refused quietly" {
     try testing.expect(parse(a, "not xml at all") == null);
     try testing.expect(parse(a, "<html><body>nope</body></html>") == null);
 
-    // every truncation must return, not crash
     var n: usize = 0;
     while (n <= RSS.len) : (n += 1) _ = parse(a, RSS[0..n]);
 }
@@ -504,23 +483,19 @@ test "subscription file round-trips and rejects hand-edited junk" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const p = try a.dupeZ(u8, "/tmp/hum_feeds_XXXXXX");
-    const fd = fsutil.c.mkstemp(p.ptr);
-    try testing.expect(fd >= 0);
-    _ = fsutil.c.close(fd);
+    const p = try fsutil.makeTemp(a, "hum_feeds_", "");
     defer _ = fsutil.c.unlink(p.ptr);
 
     try saveSubs(a, p, &[_]Sub{
         .{ .url = "https://example.com/feed.xml", .title = "Some\tPodcast" },
-        .{ .url = "javascript:alert(1)", .title = "nope" }, // never written
+        .{ .url = "javascript:alert(1)", .title = "nope" },
     });
 
     const back = loadSubs(a, p);
     try testing.expectEqual(@as(usize, 1), back.len);
     try testing.expectEqualStrings("https://example.com/feed.xml", back[0].url);
-    try testing.expectEqualStrings("Some Podcast", back[0].title); // tab neutralized
+    try testing.expectEqualStrings("Some Podcast", back[0].title);
 
-    // a hand-edited file can contain anything; bad rows are skipped
     try fsutil.writeFile(a, p, "file:///etc/passwd\tevil\n# comment\n\nhttps://ok.com/f.xml\tOK\n");
     const back2 = loadSubs(a, p);
     try testing.expectEqual(@as(usize, 1), back2.len);

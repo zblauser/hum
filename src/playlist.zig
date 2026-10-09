@@ -48,7 +48,6 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![]Entry {
         const title = f.next() orelse continue;
         const artist = f.next() orelse "";
         const kind = f.next() orelse "Song";
-        // a four-column row predates the source column and is a YouTube track
         const source = track_mod.sourceByName(f.next() orelse "");
         const duration = track_mod.parseDuration(f.next() orelse "");
         try tracks.append(arena, .{
@@ -65,13 +64,11 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![]Entry {
     return out.toOwnedSlice(arena);
 }
 
-/// One target column: a video id, or a path/URL.
 fn targetOf(t: api.Track) []const u8 {
     return if (t.source == .youtube) t.video_id else t.uri;
 }
 
 pub fn save(arena: std.mem.Allocator, file_path: []const u8, entries: []const Entry) !void {
-    // sanitize on write: a tab or newline in a title would forge rows here
     var buf: std.ArrayList(u8) = .empty;
     for (entries) |e| {
         try buf.print(arena, "[{s}]\n", .{try txt.sanitize(arena, e.name)});
@@ -145,11 +142,7 @@ pub fn removeList(arena: std.mem.Allocator, file_path: []const u8, name: []const
 const testing = std.testing;
 
 fn tmpPath(a: std.mem.Allocator) ![:0]const u8 {
-    const p = try a.dupeZ(u8, "/tmp/hum_pl_XXXXXX");
-    const fd = c.mkstemp(p.ptr);
-    if (fd < 0) return error.TempFailed;
-    _ = c.close(fd);
-    return p;
+    return fsutil.makeTemp(a, "hum_pl_", "");
 }
 
 test "playlists round-trip through the file" {
@@ -199,7 +192,11 @@ test "cleanName trims and strips a leading bracket" {
     try testing.expectEqualStrings("chill]", cleanName("[chill]"));
     try testing.expectEqualStrings("", cleanName("   "));
 
-    const long = "あ" ** 40; // 120 bytes, 3 per codepoint
+    const long = comptime blk: {
+        var s: []const u8 = "";
+        for (0..40) |_| s = s ++ "あ";
+        break :blk s;
+    };
     const cut = cleanName(long);
     try testing.expectEqual(@as(usize, 63), cut.len);
     try testing.expect(std.unicode.utf8ValidateSlice(cut));

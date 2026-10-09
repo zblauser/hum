@@ -152,7 +152,7 @@ test "indexOf matches all and only declared themes" {
     try testing.expectEqual(@as(?usize, 0), indexOf("red"));
     try testing.expectEqual(@as(?usize, 1), indexOf("cyan"));
     try testing.expectEqual(@as(?usize, all.len - 1), indexOf("solarized"));
-    try testing.expect(indexOf("yt") == null); // alias is not a declared name
+    try testing.expect(indexOf("yt") == null);
 }
 
 test "names is generated from the all table" {

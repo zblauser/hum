@@ -12,16 +12,26 @@ const tags_mod = @import("tags.zig");
 const library = @import("library.zig");
 const feed = @import("feed.zig");
 const log = @import("log.zig");
+const mpv = @import("mpv.zig");
 
-// the one libc @cImport for the program lives in fsutil; don't add another
 const c = @import("fsutil.zig").c;
+
+fn restoreDefaultSignals() void {
+    const default: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.INT, &default, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &default, null);
+}
+
+fn printOut(comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    try putStdout(try std.fmt.bufPrint(&buf, fmt, args));
+}
 
 fn putStdout(bytes: []const u8) !void {
     var i: usize = 0;
     while (i < bytes.len) {
         const n = c.write(1, bytes[i..].ptr, bytes.len - i);
         if (n < 0) {
-            // a closed pipe is the reader saying enough, not an error
             if (std.c._errno().* == c.EPIPE) std.process.exit(0);
             return error.WriteFailed;
         }
@@ -31,6 +41,7 @@ fn putStdout(bytes: []const u8) !void {
 }
 
 pub const VERSION = @import("build_options").version;
+pub const MPV_HINT = "nothing can play; install mpv (brew install mpv, apt install libmpv2)";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -93,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (eq(first, "doctor")) {
-        try cmdDoctor(arena, io, init.environ_map);
+        try cmdDoctor(gpa, arena, io, init.environ_map);
         return;
     }
     if (eq(first, "library")) {
@@ -119,11 +130,10 @@ pub fn main(init: std.process.Init) !void {
 fn resolveThemeName(arena: std.mem.Allocator, env: *std.process.Environ.Map) []const u8 {
     var name: []const u8 = "red";
     if (config.path(arena, env)) |p| {
-        if (config.loadTheme(arena, p)) |saved| {
+        if (config.loadKey(arena, p, .theme)) |saved| {
             if (theme_mod.byName(saved) != null) name = saved;
         }
     } else |_| {}
-    // YTCLI_THEME still works so existing shell profiles keep going
     inline for (.{ "YTCLI_THEME", "HUM_THEME" }) |key| {
         if (env.get(key)) |e| {
             if (theme_mod.byName(e) != null) name = e;
@@ -185,36 +195,35 @@ fn cmdPlay(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, words: 
     const audio_url = try stream.resolve(gpa, io, t);
     defer gpa.free(audio_url);
 
-    var p = try player.Player.init();
+    var p = player.Player.init() catch |err| {
+        if (err != error.MpvMissing) return err;
+        std.debug.print("libmpv not found: {s}\n", .{MPV_HINT});
+        std.process.exit(1);
+    };
     defer p.deinit();
-    try p.loadUrl(arena, audio_url);
+    try p.loadUrl(arena, audio_url, try t.mediaTitle(arena));
     while (true) {
         const ev = p.pollEvent();
         switch (ev) {
             .end_file, .shutdown => return,
+            .audio_ready => restoreDefaultSignals(),
             else => _ = c.usleep(50_000),
         }
     }
 }
 
-/// A lone URL or existing file is played rather than searched.
 fn directTarget(arena: std.mem.Allocator, io: std.Io, words: []const [:0]const u8) ?api.Track {
     if (words.len != 1) return null;
     const arg = words[0];
     if (arg.len == 0) return null;
 
-    const source: track_mod.Source = if (track_mod.isUrl(arg))
-        .url
-    else if (std.Io.Dir.cwd().statFile(io, arg, .{})) |st|
-        if (st.kind == .directory) return null else .local
-    else |_|
-        return null;
-
-    if (source == .url) {
+    if (track_mod.isUrl(arg)) {
         return .{ .source = .url, .uri = arg, .title = arg, .artist = "stream" };
     }
+    const st = std.Io.Dir.cwd().statFile(io, arg, .{}) catch return null;
+    if (st.kind == .directory) return null;
 
-    const meta = tags_mod.readOrPath(arena, arg);
+    const meta = tags_mod.readOrPath(arena, arg, st.size);
     return .{
         .source = .local,
         .uri = arg,
@@ -236,8 +245,6 @@ fn cmdSearch(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, words
     }
 }
 
-/// Paths in use, settings, library state and required binaries — written for pasting into a bug report.
-/// Podcast subscriptions: subscribe, list, unsubscribe, print episodes.
 fn cmdFeeds(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -245,7 +252,6 @@ fn cmdFeeds(
     env: *std.process.Environ.Map,
     args: []const [:0]const u8,
 ) !void {
-    var buf: [4096]u8 = undefined;
     const fpath = feed.path(arena, env) catch {
         std.debug.print("no data path (HOME unset)\n", .{});
         return;
@@ -259,10 +265,10 @@ fn cmdFeeds(
             return;
         }
         for (subs.items) |sub| {
-            try putStdout(try std.fmt.bufPrint(&buf, "{s}\n  {s}\n", .{
+            try printOut("{s}\n  {s}\n", .{
                 if (sub.title.len > 0) sub.title else "(untitled)",
                 sub.url,
-            }));
+            });
         }
         return;
     }
@@ -294,10 +300,10 @@ fn cmdFeeds(
         };
         try subs.append(arena, .{ .url = url, .title = parsed.title });
         try feed.saveSubs(arena, fpath, subs.items);
-        try putStdout(try std.fmt.bufPrint(&buf, "subscribed: {s}  ({d} episodes)\n", .{
+        try printOut("subscribed: {s}  ({d} episodes)\n", .{
             if (parsed.title.len > 0) parsed.title else url,
             parsed.episodes.len,
-        }));
+        });
         return;
     }
 
@@ -324,7 +330,6 @@ fn cmdFeeds(
         return;
     }
 
-    // `hum feeds <substring>` prints that feed's episodes
     for (subs.items) |sub| {
         const hay = if (sub.title.len > 0) sub.title else sub.url;
         if (!containsIgnoreCase(hay, args[0]) and !containsIgnoreCase(sub.url, args[0])) continue;
@@ -343,7 +348,7 @@ fn cmdFeeds(
                 std.fmt.bufPrint(&dur, "{d}:{d:0>2}", .{ ep.duration_s / 60, ep.duration_s % 60 }) catch ""
             else
                 "";
-            try putStdout(try std.fmt.bufPrint(&buf, "{d:2}. {s}  {s}\n    {s}\n", .{ i + 1, ep.title, when, ep.url }));
+            try printOut("{d:2}. {s}  {s}\n    {s}\n", .{ i + 1, ep.title, when, ep.url });
         }
         return;
     }
@@ -359,8 +364,7 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn cmdDoctor(arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !void {
-    _ = io;
+fn cmdDoctor(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !void {
     var buf: [4096]u8 = undefined;
     try putStdout("hum " ++ VERSION ++ "\n\n");
 
@@ -375,17 +379,17 @@ fn cmdDoctor(arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map
     var legacy_seen = false;
     for (known) |k| {
         const path = k.path orelse {
-            try putStdout(try std.fmt.bufPrint(&buf, "  {s: <14} (unavailable — HOME unset?)\n", .{k.label}));
+            try printOut("  {s: <14} (unavailable — HOME unset?)\n", .{k.label});
             continue;
         };
         const legacy = std.mem.indexOf(u8, path, "/ytcli/") != null;
         if (legacy) legacy_seen = true;
-        try putStdout(try std.fmt.bufPrint(&buf, "  {s: <14} {s}{s}{s}\n", .{
+        try printOut("  {s: <14} {s}{s}{s}\n", .{
             k.label,
             path,
             if (exists(arena, path)) "" else "   (not created yet)",
             if (legacy) "   [pre-rename dir, still read]" else "",
-        }));
+        });
     }
     if (legacy_seen) {
         try putStdout("  note: reading directories from before the ytcli→hum rename. Nothing was moved;\n" ++
@@ -394,29 +398,29 @@ fn cmdDoctor(arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map
 
     try putStdout("\nsettings\n");
     const cfg = config.path(arena, env) catch "";
-    inline for (.{ "theme", "volume", "scope", "splash", "music_dir" }) |key| {
+    for (std.enums.values(config.Key)) |key| {
         const val = if (cfg.len > 0) config.loadKey(arena, cfg, key) else null;
-        try putStdout(try std.fmt.bufPrint(&buf, "  {s: <14} {s}\n", .{ key, val orelse "(unset)" }));
+        try printOut("  {s: <14} {s}\n", .{ @tagName(key), val orelse "(unset)" });
     }
 
     try putStdout("\nlibrary\n");
-    const music_dir = if (cfg.len > 0) config.loadKey(arena, cfg, "music_dir") else null;
+    const music_dir = if (cfg.len > 0) config.loadKey(arena, cfg, .music_dir) else null;
     if (music_dir) |dir| {
         const dirs = library.roots(arena, env, dir) catch &.{};
         for (dirs) |root| {
-            try putStdout(try std.fmt.bufPrint(&buf, "  root           {s}{s}\n", .{
+            try printOut("  root           {s}{s}\n", .{
                 root,
                 if (exists(arena, root)) "" else "   MISSING",
-            }));
+            });
         }
         const cache_path = library.cachePath(arena, env) catch "";
         const cached: library.Cached = if (cache_path.len > 0) library.loadCache(arena, cache_path) else .{};
         if (cached.entries.len == 0) {
             try putStdout("  index          empty — run: hum library scan\n");
         } else if (!cached.matches(dir)) {
-            try putStdout(try std.fmt.bufPrint(&buf, "  index          {d} tracks, but built from a different music_dir — rescan\n", .{cached.entries.len}));
+            try printOut("  index          {d} tracks, but built from a different music_dir — rescan\n", .{cached.entries.len});
         } else {
-            try putStdout(try std.fmt.bufPrint(&buf, "  index          {d} tracks\n", .{cached.entries.len}));
+            try printOut("  index          {d} tracks\n", .{cached.entries.len});
         }
     } else {
         try putStdout("  music_dir unset — run: hum library dir ~/Music\n");
@@ -425,28 +429,42 @@ fn cmdDoctor(arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map
     try putStdout("\ndependencies\n");
     inline for (.{ "curl", "yt-dlp" }) |exe| {
         if (onPath(arena, env, exe)) |full| {
-            try putStdout(try std.fmt.bufPrint(&buf, "  {s: <14} {s}\n", .{ exe, full }));
+            try printOut("  {s: <14} {s}\n", .{ exe, full });
         } else {
-            try putStdout("  " ++ exe ++ (" " ** (14 - exe.len)) ++ " MISSING — youtube search and playback will fail\n");
+            try printOut("  {s: <14} MISSING — youtube search and playback will fail\n", .{exe});
         }
     }
-    try putStdout("  libmpv         linked at build time (local files need nothing else)\n");
+    if (stream.ytdlpVersion(gpa, io)) |ver| {
+        defer gpa.free(ver);
+        const v = std.mem.trim(u8, ver, " \r\n\t");
+        const age = stream.ytdlpAgeDays(v, std.Io.Clock.real.now(io).toSeconds());
+        if (age != null and age.? >= stream.STALE_DAYS) {
+            try printOut("  yt-dlp version {s}   STALE ({d} days) — youtube rejects old builds; update it\n", .{ v, age.? });
+        } else {
+            try printOut("  yt-dlp version {s}\n", .{v});
+        }
+    }
+    if (mpv.load()) |_| {
+        try printOut("  libmpv         {s}\n", .{mpv.describe(buf[2048..]) orelse "loaded"});
+    } else |_| {
+        try putStdout("  libmpv         MISSING — " ++ MPV_HINT ++ "\n");
+        if (mpv.failure().len > 0) try printOut("                 found one, but: {s}\n", .{mpv.failure()});
+    }
 }
 
 fn exists(arena: std.mem.Allocator, path: []const u8) bool {
-    const z = arena.dupeZ(u8, path) catch return false;
-    return c.access(z.ptr, 0) == 0; // F_OK
+    const z = arena.dupeSentinel(u8, path, 0) catch return false;
+    return c.access(z.ptr, 0) == 0;
 }
 
-/// First hit in $PATH — the same lookup the subprocess spawn will do.
 fn onPath(arena: std.mem.Allocator, env: *std.process.Environ.Map, name: []const u8) ?[]const u8 {
     const path_env = env.get("PATH") orelse return null;
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         const full = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name }) catch continue;
-        const z = arena.dupeZ(u8, full) catch continue;
-        if (c.access(z.ptr, 1) == 0) return full; // X_OK
+        const z = arena.dupeSentinel(u8, full, 0) catch continue;
+        if (c.access(z.ptr, 1) == 0) return full;
     }
     return null;
 }
@@ -459,7 +477,6 @@ fn cmdLibrary(
     args: []const [:0]const u8,
 ) !void {
     _ = gpa;
-    var buf: [4096]u8 = undefined;
     const cfg = config.path(arena, env) catch {
         std.debug.print("no config path (HOME unset)\n", .{});
         return;
@@ -470,18 +487,17 @@ fn cmdLibrary(
             try putStdout("usage: hum library dir <path>\n");
             return;
         }
-        try config.saveKey(arena, cfg, "music_dir", args[1]);
-        try putStdout(try std.fmt.bufPrint(&buf, "music_dir = {s}\n", .{args[1]}));
+        try config.saveKey(arena, cfg, .music_dir, args[1]);
+        try printOut("music_dir = {s}\n", .{args[1]});
         return;
     }
 
-    const music_dir = config.loadKey(arena, cfg, "music_dir") orelse {
+    const music_dir = config.loadKey(arena, cfg, .music_dir) orelse {
         try putStdout("no music_dir set — try: hum library dir ~/Music\n");
         return;
     };
     const cache = library.cachePath(arena, env) catch "";
     const from_disk: library.Cached = if (cache.len > 0) library.loadCache(arena, cache) else .{};
-    // a cache from other roots describes another library
     var entries: []library.Entry = if (from_disk.matches(music_dir)) from_disk.entries else &.{};
 
     const rescan = args.len > 0 and eq(args[0], "scan");
@@ -493,13 +509,13 @@ fn cmdLibrary(
     }
 
     const artists = try library.artistsOf(arena, entries);
-    try putStdout(try std.fmt.bufPrint(&buf, "{d} tracks · {d} artists · {s}\n", .{ entries.len, artists.len, music_dir }));
+    try printOut("{d} tracks · {d} artists · {s}\n", .{ entries.len, artists.len, music_dir });
     for (artists) |name| {
         var count: usize = 0;
         for (entries) |e| {
             if (std.ascii.eqlIgnoreCase(e.artist, name)) count += 1;
         }
-        try putStdout(try std.fmt.bufPrint(&buf, "  {s}  [{d}]\n", .{ name, count }));
+        try printOut("  {s}  [{d}]\n", .{ name, count });
     }
 }
 
@@ -513,16 +529,15 @@ fn cmdPlaylists(arena: std.mem.Allocator, env: *std.process.Environ.Map, want: ?
         std.debug.print("(no playlists — press P on a result in the TUI)\n", .{});
         return;
     }
-    var buf: [4096]u8 = undefined;
     for (lists) |e| {
         if (want) |name| {
             if (!std.mem.eql(u8, e.name, name)) continue;
             for (e.tracks, 0..) |t, i| {
-                try putStdout(try std.fmt.bufPrint(&buf, "{d:2}. {s} — {s}  [{s}]\n", .{ i + 1, t.title, t.artist, t.video_id }));
+                try printOut("{d:2}. {s} — {s}  [{s}]\n", .{ i + 1, t.title, t.artist, t.video_id });
             }
             return;
         }
-        try putStdout(try std.fmt.bufPrint(&buf, "{s}  [{d}]\n", .{ e.name, e.tracks.len }));
+        try printOut("{s}  [{d}]\n", .{ e.name, e.tracks.len });
     }
     if (want) |name| std.debug.print("no playlist named {s}\n", .{name});
 }
