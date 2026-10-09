@@ -1,5 +1,6 @@
 const std = @import("std");
 const proc = @import("proc.zig");
+const SUGGEST_TIMEOUT_S = "3";
 const text = @import("text.zig");
 
 pub const Error = error{
@@ -10,14 +11,13 @@ pub fn fetch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, query
     if (query.len == 0) return &.{};
 
     const escaped = try urlEscape(arena, query);
-    // ie/oe are not optional: without them the endpoint answers in latin-1
     const url = try std.fmt.allocPrint(
         arena,
         "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&ie=utf-8&oe=utf-8&q={s}",
         .{escaped},
     );
 
-    const resp = try proc.runCapture(gpa, io, &.{ "curl", "-sS", "--max-time", "3", url });
+    const resp = try proc.runCapture(gpa, io, &.{ "curl", "-sS", "--max-time", SUGGEST_TIMEOUT_S, url });
     defer gpa.free(resp);
 
     const parsed = std.json.parseFromSlice(std.json.Value, arena, resp, .{}) catch return error.BadResponse;

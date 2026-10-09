@@ -1,25 +1,40 @@
 const std = @import("std");
 
-/// The one libc @cImport for the program; FreeBSD translate-c workarounds live here.
-pub const c = @cImport({
-    // FreeBSD's __ssp fortify wrappers break translate-c; disable them
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-    @cInclude("errno.h");
-    @cInclude("unistd.h");
-});
+pub const c = struct {
+    pub const FILE = std.c.FILE;
+    pub const fopen = std.c.fopen;
+    pub const fclose = std.c.fclose;
+    pub const fread = std.c.fread;
+    pub const fwrite = std.c.fwrite;
+    pub const write = std.c.write;
+    pub const close = std.c.close;
+    pub const unlink = std.c.unlink;
+    pub const rmdir = std.c.rmdir;
+    pub const access = std.c.access;
+    pub const getenv = std.c.getenv;
+    pub const _exit = std.c._exit;
 
-/// Our own files (history, playlists, config) are small by construction.
+    pub extern "c" fn fseek(stream: *FILE, offset: c_long, whence: c_int) c_int;
+    pub extern "c" fn ftell(stream: *FILE) c_long;
+    pub extern "c" fn mkstemp(template: [*:0]u8) c_int;
+    pub extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+    pub extern "c" fn usleep(usec: c_uint) c_int;
+
+    pub const SEEK_SET: c_int = 0;
+    pub const SEEK_END: c_int = 2;
+    pub const F_OK: c_uint = 0;
+    pub const EPIPE: c_int = @backingInt(std.c.E.PIPE);
+    pub const EEXIST: c_int = @backingInt(std.c.E.EXIST);
+};
+
 const READ_ALL_CAP: usize = 8 * 1024 * 1024;
 
 pub fn readFileAlloc(arena: std.mem.Allocator, file_path: []const u8) ?[]u8 {
     return readCappedAlloc(arena, file_path, READ_ALL_CAP);
 }
 
-/// Reads at most `max` bytes: a tag read must never be sized by the file.
 pub fn readCappedAlloc(arena: std.mem.Allocator, file_path: []const u8, max: usize) ?[]u8 {
-    const path_z = arena.dupeZ(u8, file_path) catch return null;
+    const path_z = arena.dupeSentinel(u8, file_path, 0) catch return null;
     const f = c.fopen(path_z.ptr, "rb") orelse return null;
     defer _ = c.fclose(f);
 
@@ -35,7 +50,6 @@ pub fn readCappedAlloc(arena: std.mem.Allocator, file_path: []const u8, max: usi
     return buf[0..n];
 }
 
-/// LEGACY_DIR is the pre-v0.1.7 name; see `xdgPath`.
 const APP_DIR = "hum";
 const LEGACY_DIR = "ytcli";
 
@@ -43,7 +57,6 @@ fn exists(path: [:0]const u8) bool {
     return c.access(path.ptr, c.F_OK) == 0;
 }
 
-/// Falls back to the legacy dir when the new path does not exist, and copies nothing: an upgrade keeps working with no migration step.
 pub fn xdgPath(
     arena: std.mem.Allocator,
     env: *std.process.Environ.Map,
@@ -67,10 +80,9 @@ pub fn xdgPath(
     return current;
 }
 
-/// Create the parent directory, then write (mode "wb") or append (mode "ab") bytes.
 fn writeMode(arena: std.mem.Allocator, file_path: []const u8, bytes: []const u8, mode: [*:0]const u8) !void {
     if (std.fs.path.dirname(file_path)) |dir| try makePathZ(arena, dir);
-    const path_z = try arena.dupeZ(u8, file_path);
+    const path_z = try arena.dupeSentinel(u8, file_path, 0);
     const f = c.fopen(path_z.ptr, mode) orelse return error.OpenFailed;
     defer _ = c.fclose(f);
     if (bytes.len == 0) return;
@@ -85,6 +97,20 @@ pub fn appendFile(arena: std.mem.Allocator, file_path: []const u8, bytes: []cons
     return writeMode(arena, file_path, bytes, "ab");
 }
 
+pub fn makeTemp(arena: std.mem.Allocator, prefix: []const u8, contents: []const u8) ![:0]u8 {
+    const path = try std.fmt.allocPrintSentinel(arena, "/tmp/{s}XXXXXX", .{prefix}, 0);
+    const fd = c.mkstemp(path.ptr);
+    if (fd < 0) return error.TempFileOpen;
+    defer _ = c.close(fd);
+    var off: usize = 0;
+    while (off < contents.len) {
+        const n = c.write(fd, contents[off..].ptr, contents.len - off);
+        if (n <= 0) return error.TempFileWrite;
+        off += @intCast(n);
+    }
+    return path;
+}
+
 pub fn makePathZ(arena: std.mem.Allocator, dir: []const u8) !void {
     var i: usize = 0;
     while (i < dir.len) {
@@ -92,7 +118,7 @@ pub fn makePathZ(arena: std.mem.Allocator, dir: []const u8) !void {
         const start = i;
         while (i < dir.len and dir[i] != '/') : (i += 1) {}
         if (i == start) break;
-        const partial = try arena.dupeZ(u8, dir[0..i]);
+        const partial = try arena.dupeSentinel(u8, dir[0..i], 0);
         const r = std.c.mkdir(partial.ptr, 0o755);
         if (r != 0) {
             const e = std.c._errno().*;
@@ -108,22 +134,14 @@ test "readFileAlloc round-trips contents; null on empty or missing" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const path = try a.dupeZ(u8, "/tmp/hum_rfa_XXXXXX");
-    const fd = c.mkstemp(path.ptr);
-    try testing.expect(fd >= 0);
+    const path = try makeTemp(a, "hum_rfa_", "hello\nworld");
     defer _ = c.unlink(path.ptr);
-    const data = "hello\nworld";
-    try testing.expectEqual(@as(isize, data.len), c.write(fd, data.ptr, data.len));
-    _ = c.close(fd);
 
     const got = readFileAlloc(a, path) orelse return error.TestUnexpectedNull;
     try testing.expectEqualStrings("hello\nworld", got);
 
-    const empty = try a.dupeZ(u8, "/tmp/hum_rfae_XXXXXX");
-    const efd = c.mkstemp(empty.ptr);
-    try testing.expect(efd >= 0);
+    const empty = try makeTemp(a, "hum_rfae_", "");
     defer _ = c.unlink(empty.ptr);
-    _ = c.close(efd);
     try testing.expect(readFileAlloc(a, empty) == null);
 
     try testing.expect(readFileAlloc(a, "/tmp/hum_definitely_missing_zzz") == null);
@@ -134,7 +152,7 @@ test "makePathZ creates nested dirs and is idempotent" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const base = try a.dupeZ(u8, "/tmp/hum_mp_XXXXXX");
+    const base = try a.dupeSentinel(u8, "/tmp/hum_mp_XXXXXX", 0);
     try testing.expect(c.mkdtemp(base.ptr) != null);
 
     const mid = try std.fmt.allocPrintSentinel(a, "{s}/a", .{base}, 0);
@@ -159,7 +177,7 @@ test "xdgPath prefers the new dir, falls back to the pre-rename one" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const base = try a.dupeZ(u8, "/tmp/hum_xdg_XXXXXX");
+    const base = try a.dupeSentinel(u8, "/tmp/hum_xdg_XXXXXX", 0);
     try testing.expect(c.mkdtemp(base.ptr) != null);
 
     const new_dir = try std.fmt.allocPrintSentinel(a, "{s}/hum", .{base}, 0);
@@ -177,14 +195,11 @@ test "xdgPath prefers the new dir, falls back to the pre-rename one" {
     var env: std.process.Environ.Map = .init(a);
     try env.put("XDG_DATA_HOME", base);
 
-    // fresh install gets the new path
     try testing.expectEqualStrings(new_file, try xdgPath(a, &env, "XDG_DATA_HOME", ".local/share", "history"));
 
-    // only the legacy file exists: keep reading it
     try writeFile(a, old_file, "elephant gym\n");
     try testing.expectEqualStrings(old_file, try xdgPath(a, &env, "XDG_DATA_HOME", ".local/share", "history"));
 
-    // the new path wins once it exists
     try writeFile(a, new_file, "autechre\n");
     try testing.expectEqualStrings(new_file, try xdgPath(a, &env, "XDG_DATA_HOME", ".local/share", "history"));
 }

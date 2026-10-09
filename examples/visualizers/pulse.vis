@@ -1,0 +1,49 @@
+# copy into ~/.config/hum/visualizers/ and press v in the visualizer view (^V)
+#
+# name   shown in the header; defaults to the file name
+# fps    1-30 frames per second
+# speed  fixed | level   (level: louder music plays the frames faster)
+# color  level | dim | accent | strong   (level: dim when quiet, bright when loud)
+#
+# frames follow, each starting with a line that is just ---
+
+name  = pulse
+fps   = 6
+speed = level
+color = level
+---
+
+
+            ·
+
+
+---
+
+           ╭─╮
+           │·│
+           ╰─╯
+
+---
+          ╭───╮
+         ╭╯   ╰╮
+         │  ·  │
+         ╰╮   ╭╯
+          ╰───╯
+---
+        ╭───────╮
+      ╭─╯       ╰─╮
+      │     ·     │
+      ╰─╮       ╭─╯
+        ╰───────╯
+---
+          ╭───╮
+         ╭╯   ╰╮
+         │  ·  │
+         ╰╮   ╭╯
+          ╰───╯
+---
+
+           ╭─╮
+           │·│
+           ╰─╯
+

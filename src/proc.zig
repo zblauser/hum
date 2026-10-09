@@ -3,7 +3,6 @@ const log = @import("log.zig");
 
 pub const Error = error{ProcFailed} || std.process.RunError;
 
-/// A remote endpoint decides how much these print, so cap what we buffer.
 const STDOUT_LIMIT = 32 * 1024 * 1024;
 const STDERR_LIMIT = 64 * 1024;
 

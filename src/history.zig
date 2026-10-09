@@ -31,7 +31,6 @@ pub fn load(arena: std.mem.Allocator, file_path: []const u8) ![][]const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Most recent wins: one line per search, rewritten whole to stay hand-editable.
 pub fn append(arena: std.mem.Allocator, file_path: []const u8, query: []const u8) !void {
     const clean = std.mem.trim(u8, try txt.sanitize(arena, query), " \t\r");
     if (clean.len == 0) return;
@@ -111,10 +110,7 @@ test "remove drops one entry and keeps the rest" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const p = try a.dupeZ(u8, "/tmp/hum_hist_XXXXXX");
-    const fd = c.mkstemp(p.ptr);
-    try testing.expect(fd >= 0);
-    _ = c.close(fd);
+    const p = try fsutil.makeTemp(a, "hum_hist_", "");
     defer _ = c.unlink(p.ptr);
 
     for ([_][]const u8{ "ado", "hong ting", "nina simone" }) |q| try append(a, p, q);
@@ -139,10 +135,7 @@ test "append keeps one line per query and moves a repeat to the end" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const p = try a.dupeZ(u8, "/tmp/hum_hdup_XXXXXX");
-    const fd = c.mkstemp(p.ptr);
-    try testing.expect(fd >= 0);
-    _ = c.close(fd);
+    const p = try fsutil.makeTemp(a, "hum_hdup_", "");
     defer _ = c.unlink(p.ptr);
 
     for ([_][]const u8{ "tricot", "autechre", "tricot", "delta sleep", "tricot" }) |q| {
@@ -152,7 +145,6 @@ test "append keeps one line per query and moves a repeat to the end" {
     const raw = fsutil.readFileAlloc(a, p) orelse return error.TestUnexpectedNull;
     try testing.expectEqualStrings("autechre\ndelta sleep\ntricot\n", raw);
 
-    // and the display order still puts the newest first
     const shown = try load(a, p);
     try testing.expectEqual(@as(usize, 3), shown.len);
     try testing.expectEqualStrings("tricot", shown[0]);

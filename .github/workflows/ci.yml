@@ -15,18 +15,19 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
-
-      - name: install libmpv
-        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+          version: 0.17.0
 
       - name: unit tests
         run: |
-          zig build test -Dmpv-prefix=
-          zig build test -Doptimize=ReleaseSafe -Dmpv-prefix=
+          zig build test
+          zig build test -Doptimize=ReleaseSafe
 
-      # Type-checks freebsd/linux/macos in Debug and ReleaseSafe without
-      # linking. The FreeBSD release leg has broken twice on translate-c; this
-      # catches that on every push instead of at tag time inside a VM.
       - name: cross-target check
         run: zig build check
+
+      - name: libmpv runtime load
+        run: |
+          sudo apt-get update && sudo apt-get install -y libmpv2
+          zig build
+          ./zig-out/bin/hum doctor | tee doctor.txt
+          grep -E '^  libmpv +libmpv\.so' doctor.txt

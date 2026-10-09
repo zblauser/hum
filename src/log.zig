@@ -9,15 +9,12 @@ extern "c" fn time(?*time_t) time_t;
 extern "c" fn localtime(*const time_t) ?*Tm;
 extern "c" fn strftime(noalias [*]u8, usize, noalias [*:0]const u8, noalias *const Tm) usize;
 
-// null leaves logging a no-op, so callers never check
 var path_z: ?[:0]const u8 = null;
 
-/// $XDG_DATA_HOME/hum/log, beside the history file.
 pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]const u8 {
     return fsutil.xdgPath(arena, env, "XDG_DATA_HOME", ".local/share", "log");
 }
 
-/// Pass a long-lived allocator; on any failure logging stays off.
 pub fn init(arena: std.mem.Allocator, env: *std.process.Environ.Map) void {
     const p = path(arena, env) catch return;
     if (std.fs.path.dirname(p)) |dir| {
@@ -26,7 +23,6 @@ pub fn init(arena: std.mem.Allocator, env: *std.process.Environ.Map) void {
     path_z = p;
 }
 
-/// Best-effort: errors are swallowed so logging never masks the original failure.
 pub fn write(comptime fmt: []const u8, args: anytype) void {
     const p = path_z orelse return;
 
@@ -41,7 +37,6 @@ pub fn write(comptime fmt: []const u8, args: anytype) void {
     _ = c.fwrite(line.ptr, 1, line.len, f);
 }
 
-// "YYYY-MM-DD HH:MM:SS" in local time via libc; returns the filled slice.
 fn stamp(out: *[20]u8) []const u8 {
     const t = time(null);
     const tm = localtime(&t) orelse return "";

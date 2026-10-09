@@ -5,7 +5,6 @@ const track_mod = @import("track.zig");
 const txt = @import("text.zig");
 const log = @import("log.zig");
 
-/// One indexed file. Strings live in the index arena and outlive the rows built from them.
 pub const Entry = struct {
     path: []const u8,
     title: []const u8 = "",
@@ -13,19 +12,16 @@ pub const Entry = struct {
     album: []const u8 = "",
     track_no: u16 = 0,
     duration_s: u32 = 0,
-    /// mtime + size are the cache key: if neither changed, the tags did not.
     mtime: i64 = 0,
     size: u64 = 0,
 };
 
-/// Which files to open at all; the tag parser still dispatches on magic bytes.
 const EXTS = [_][]const u8{
     ".mp3",  ".flac", ".m4a", ".aac",  ".alac", ".ogg",
     ".opus", ".wav",  ".aif", ".aiff", ".wma",  ".mp4",
     ".m4b",  ".oga",  ".ape", ".wv",
 };
 
-/// A symlinked directory can point at its own parent, so the walk needs these ends.
 const MAX_FILES: usize = 50_000;
 const MAX_DEPTH: usize = 12;
 
@@ -41,12 +37,10 @@ pub fn isAudio(name: []const u8) bool {
     return false;
 }
 
-/// A rebuildable index belongs in the cache, not beside the playlists.
 pub fn cachePath(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]const u8 {
     return fsutil.xdgPath(arena, env, "XDG_CACHE_HOME", ".cache", "library");
 }
 
-/// Several roots, $PATH-style. A leading `~/` is expanded so the config stays portable.
 pub fn roots(arena: std.mem.Allocator, env: *std.process.Environ.Map, configured: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, configured, ':');
@@ -63,19 +57,16 @@ pub fn roots(arena: std.mem.Allocator, env: *std.process.Environ.Map, configured
     return out.toOwnedSlice(arena);
 }
 
-/// Returning false aborts: a scan of a network mount must be escapable.
 pub const Progress = struct {
     ctx: *anyopaque,
     on: *const fn (ctx: *anyopaque, scanned: usize) bool,
 };
 
-/// `complete` tells the caller not to cache a partial index as if it were whole.
 pub const Result = struct {
     entries: []Entry,
     complete: bool = true,
 };
 
-/// Reuses cached rows whose mtime and size are unchanged; tag-reads only what is new.
 pub fn scan(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -107,7 +98,6 @@ pub fn scan(
             if (entry.kind != .file) continue;
             if (entry.depth() > MAX_DEPTH) continue;
             if (!isAudio(entry.basename)) continue;
-            // skip dotted paths: .Trash, .git, resource forks
             if (std.mem.indexOf(u8, entry.path, "/.") != null or entry.path[0] == '.') continue;
 
             const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, entry.path });
@@ -122,14 +112,14 @@ pub fn scan(
             }
 
             if (known.get(full)) |hit| {
-                if (hit.mtime == mtime and hit.size == st.size) {
+                const stale_mp3 = hit.duration_s == 0 and std.ascii.endsWithIgnoreCase(full, ".mp3");
+                if (hit.mtime == mtime and hit.size == st.size and !stale_mp3) {
                     try out.append(arena, hit);
                     continue;
                 }
             }
 
-            // path below the root, never the absolute path: a flat library would take its artist from wherever the root is nested
-            var meta = tags_mod.read(arena, full) orelse tags_mod.Tags{};
+            var meta = tags_mod.read(arena, full, st.size) orelse tags_mod.Tags{};
             if (meta.title.len == 0 or meta.artist.len == 0 or meta.album.len == 0) {
                 const from_path = tags_mod.fromPath(arena, entry.path);
                 if (meta.title.len == 0) meta.title = from_path.title;
@@ -137,7 +127,6 @@ pub fn scan(
                 if (meta.album.len == 0) meta.album = from_path.album;
                 if (meta.track_no == 0) meta.track_no = from_path.track_no;
             }
-            // grouping drops empty names, so an untagged file needs a bucket to be reachable
             if (meta.artist.len == 0) meta.artist = "unknown";
             if (meta.album.len == 0) meta.album = "unknown";
 
@@ -158,18 +147,15 @@ pub fn scan(
 
 // ------------------------------------------------------------------- cache
 
-/// Rows plus the music_dir they were built from: without it, changing music_dir keeps serving the old library.
 pub const Cached = struct {
     roots: []const u8 = "",
     entries: []Entry = &.{},
 
-    /// Usable only if it was built from the roots we are asking about now.
     pub fn matches(self: Cached, music_dir: []const u8) bool {
         return self.entries.len > 0 and std.mem.eql(u8, self.roots, music_dir);
     }
 };
 
-/// #roots header, then one sanitized tab-separated row per track.
 pub fn saveCache(
     arena: std.mem.Allocator,
     file_path: []const u8,
@@ -206,7 +192,6 @@ pub fn loadCache(arena: std.mem.Allocator, file_path: []const u8) Cached {
             from_roots = line["#roots\t".len..];
             continue;
         }
-        // a headerless cache predates the roots header and never matches
         if (line[0] == '#') continue;
         var f = std.mem.splitScalar(u8, line, '\t');
         const path = f.next() orelse continue;
@@ -273,7 +258,6 @@ pub fn albumsOf(arena: std.mem.Allocator, entries: []const Entry, artist: []cons
 
 fn beforeInAlbum(_: void, a: Entry, b: Entry) bool {
     if (a.track_no != b.track_no) {
-        // untracked files sort after numbered ones rather than jumping to the top
         if (a.track_no == 0) return false;
         if (b.track_no == 0) return true;
         return a.track_no < b.track_no;
@@ -307,7 +291,6 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Substring match: title hits first, then artist and album.
 pub fn search(arena: std.mem.Allocator, entries: []const Entry, query: []const u8, max: usize) ![]Entry {
     var out: std.ArrayList(Entry) = .empty;
     if (query.len == 0) return out.items;
@@ -326,7 +309,6 @@ pub fn search(arena: std.mem.Allocator, entries: []const Entry, query: []const u
     return out.items;
 }
 
-/// Completions from the index, artists first. Prefix match: the ghost can only extend what is typed.
 pub fn namesMatching(
     arena: std.mem.Allocator,
     entries: []const Entry,
@@ -348,10 +330,8 @@ pub fn namesMatching(
     return out.items;
 }
 
-/// Album plus its artist, so a row can drill in without guessing.
 pub const AlbumRef = struct { album: []const u8, artist: []const u8 };
 
-/// Albums whose name, or whose artist, matches. An empty query means "all".
 pub fn albumsMatching(
     arena: std.mem.Allocator,
     entries: []const Entry,
@@ -375,7 +355,6 @@ pub fn albumsMatching(
     return out.items;
 }
 
-/// Artists whose name matches. An empty query means "all".
 pub fn artistsMatching(
     arena: std.mem.Allocator,
     entries: []const Entry,
@@ -392,7 +371,6 @@ pub fn artistsMatching(
     return out.items;
 }
 
-/// Index entry to queue row.
 pub fn toTrack(e: Entry) track_mod.Track {
     return .{
         .source = .local,
@@ -408,11 +386,7 @@ pub fn toTrack(e: Entry) track_mod.Track {
 const testing = std.testing;
 
 fn tmpPath(a: std.mem.Allocator) ![:0]const u8 {
-    const p = try a.dupeZ(u8, "/tmp/hum_lib_XXXXXX");
-    const fd = fsutil.c.mkstemp(p.ptr);
-    if (fd < 0) return error.TempFailed;
-    _ = fsutil.c.close(fd);
-    return p;
+    return fsutil.makeTemp(a, "hum_lib_", "");
 }
 
 test "isAudio matches by extension, case-insensitively, and rejects the rest" {
@@ -480,7 +454,7 @@ test "cache writing neutralizes a tab or newline in a path or title" {
     try saveCache(a, p, "/m", &entries);
 
     const back = loadCache(a, p).entries;
-    try testing.expectEqual(@as(usize, 1), back.len); // one row, not two
+    try testing.expectEqual(@as(usize, 1), back.len);
     try testing.expectEqualStrings("/m/evil name.flac", back[0].path);
     try testing.expectEqualStrings("row forge /x.mp3 0 0 fake", back[0].title);
 }
@@ -499,7 +473,7 @@ test "grouping lists artists and albums once, and orders tracks by number" {
     };
 
     const artists = try artistsOf(a, &entries);
-    try testing.expectEqual(@as(usize, 2), artists.len); // "bohren" and "Bohren" are one
+    try testing.expectEqual(@as(usize, 2), artists.len);
     try testing.expectEqualStrings("Aphex Twin", artists[0]);
 
     const albums = try albumsOf(a, &entries, "BOHREN");
@@ -510,7 +484,7 @@ test "grouping lists artists and albums once, and orders tracks by number" {
     try testing.expectEqual(@as(usize, 3), tracks.len);
     try testing.expectEqualStrings("First", tracks[0].title);
     try testing.expectEqualStrings("Third", tracks[1].title);
-    try testing.expectEqualStrings("Untracked", tracks[2].title); // no number sorts last
+    try testing.expectEqualStrings("Untracked", tracks[2].title);
 }
 
 test "toTrack produces a playable local row with sane fallbacks" {
@@ -545,7 +519,6 @@ test "search matches title first, then artist and album, and caps results" {
     const by_album = try search(a, &entries, "sunset", 10);
     try testing.expectEqualStrings("Prowler", by_album[0].title);
 
-    // a title hit outranks an artist hit for the same query
     const mixed = try search(a, &entries, "midnight", 10);
     try testing.expectEqualStrings("Midnight", mixed[0].title);
 
@@ -566,13 +539,11 @@ test "namesMatching completes artists before albums before titles" {
 
     const got = try namesMatching(a, &entries, "bohr", 10);
     try testing.expectEqual(@as(usize, 3), got.len);
-    try testing.expectEqualStrings("Bohren & der Club of Gore", got[0]); // artist first
-    try testing.expectEqualStrings("Bohren Rarities", got[1]); // then album
-    try testing.expectEqualStrings("Bohren Theme", got[2]); // then title
+    try testing.expectEqualStrings("Bohren & der Club of Gore", got[0]);
+    try testing.expectEqualStrings("Bohren Rarities", got[1]);
+    try testing.expectEqualStrings("Bohren Theme", got[2]);
 
-    // prefix only — the ghost can only extend what is typed
     try testing.expectEqual(@as(usize, 0), (try namesMatching(a, &entries, "earth", 10)).len);
-    // an exact match adds nothing to complete
     try testing.expectEqual(@as(usize, 0), (try namesMatching(a, &entries, "Midnight", 10)).len);
     try testing.expectEqual(@as(usize, 0), (try namesMatching(a, &entries, "", 10)).len);
     try testing.expectEqual(@as(usize, 1), (try namesMatching(a, &entries, "bohr", 1)).len);
@@ -583,13 +554,11 @@ test "a flat library takes no artist or album from the folder above the root" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // what scan() passes for a file sitting directly in the root
     const flat = tags_mod.fromPath(a, "song.mp3");
     try testing.expectEqualStrings("song", flat.title);
     try testing.expectEqualStrings("", flat.artist);
     try testing.expectEqualStrings("", flat.album);
 
-    // a nested one still derives both
     const nested = tags_mod.fromPath(a, "Bohren/Black Earth/01 Midnight.flac");
     try testing.expectEqualStrings("Midnight", nested.title);
     try testing.expectEqualStrings("Black Earth", nested.album);
@@ -601,7 +570,6 @@ test "untagged files land in an 'unknown' bucket instead of vanishing" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // what scan() produces for a tagless file in a flat root
     const entries = [_]Entry{
         .{ .path = "/m/x.flac", .title = "x", .artist = "unknown", .album = "unknown" },
         .{ .path = "/m/y.flac", .title = "y", .artist = "Real", .album = "Album" },
@@ -628,10 +596,9 @@ test "a cache built from other roots is not reused" {
     const back = loadCache(a, p);
     try testing.expectEqualStrings("/old", back.roots);
     try testing.expect(back.matches("/old"));
-    try testing.expect(!back.matches("/new")); // music_dir changed → do not serve it
+    try testing.expect(!back.matches("/new"));
     try testing.expect(!back.matches("/old:/second"));
 
-    // several roots round-trip verbatim
     try saveCache(a, p, "/one:/two", &entries);
     try testing.expect(loadCache(a, p).matches("/one:/two"));
 }
@@ -650,7 +617,7 @@ test "a headerless pre-v0.1.7 cache never matches" {
     try testing.expect(!back.matches("/m"));
 }
 
-test "albumsMatching and artistsMatching dedupe and honour an empty query" {
+test "albumsMatching and artistsMatching dedupe and honor an empty query" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -662,7 +629,7 @@ test "albumsMatching and artistsMatching dedupe and honour an empty query" {
     };
 
     const all_albums = try albumsMatching(a, &entries, "", 10);
-    try testing.expectEqual(@as(usize, 2), all_albums.len); // deduped
+    try testing.expectEqual(@as(usize, 2), all_albums.len);
 
     const by_artist = try albumsMatching(a, &entries, "bohren", 10);
     try testing.expectEqual(@as(usize, 1), by_artist.len);

@@ -1,28 +1,28 @@
 const std = @import("std");
 
-/// Where the bytes come from.
 pub const Source = enum { youtube, local, url };
 
 pub const Track = struct {
     source: Source = .youtube,
-    /// youtube only — the id yt-dlp resolves to a stream
     video_id: []const u8 = "",
-    /// local: filesystem path · url: the URL itself. Empty for youtube.
     uri: []const u8 = "",
     browse_id: []const u8 = "",
     title: []const u8,
     artist: []const u8,
     album: []const u8 = "",
-    /// 0 = unknown; YouTube rows and untagged files both hit this.
     duration_s: u32 = 0,
     kind: []const u8 = "Song",
 
-    /// Artist and album rows have no playable target, and a local row with no path is a corrupt line.
     pub fn isPlayable(self: Track) bool {
         return switch (self.source) {
             .youtube => self.video_id.len > 0,
             .local, .url => self.uri.len > 0,
         };
+    }
+
+    pub fn mediaTitle(self: Track, alloc: std.mem.Allocator) ![]const u8 {
+        if (self.source != .youtube or self.artist.len == 0) return self.title;
+        return std.fmt.allocPrint(alloc, "{s} — {s}", .{ self.title, self.artist });
     }
 };
 
@@ -34,14 +34,12 @@ pub fn sourceName(s: Source) []const u8 {
     };
 }
 
-/// Unknown or missing means youtube: pre-v0.1.7 playlists files have no source column.
 pub fn sourceByName(name: []const u8) Source {
     if (std.mem.eql(u8, name, "local")) return .local;
     if (std.mem.eql(u8, name, "url")) return .url;
     return .youtube;
 }
 
-/// True for arguments meant to be handed to the player as-is rather than searched.
 pub fn isUrl(s: []const u8) bool {
     inline for (.{ "http://", "https://", "file://" }) |scheme| {
         if (std.mem.startsWith(u8, s, scheme)) return true;
@@ -49,7 +47,6 @@ pub fn isUrl(s: []const u8) bool {
     return false;
 }
 
-/// Display string to seconds; anything unparseable is 0, never an error.
 pub fn parseDuration(s: []const u8) u32 {
     var total: u32 = 0;
     var part: u32 = 0;
@@ -88,7 +85,6 @@ test "isPlayable follows the source, not just video_id" {
     try testing.expect(local.isPlayable());
     try testing.expect(!(Track{ .source = .local, .title = "t", .artist = "a" }).isPlayable());
 
-    // a local row must not qualify just because some video_id lingers on it
     try testing.expect(!(Track{ .source = .local, .video_id = "abc", .title = "t", .artist = "a" }).isPlayable());
 }
 

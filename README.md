@@ -10,15 +10,33 @@ your local music library, streamed rss/urls, and yt music, one zig binary that r
   <img src="https://img.shields.io/badge/license-MIT-000?style=flat-square&labelColor=500" alt="MIT"/>
 </p>
 
-zig 0.16, single binary
-- `libmpv` for audio; plays local files, streams, and youtube
+zig 0.17, single binary
+- `libmpv` for audio, loaded at runtime; plays local files, streams, and youtube
 - `hum` now has it's own tag reader (id3, vorbis/flac, ogg/opus, mp4) | no taglib, no ffprobe
 - shells out to `curl` and `yt-dlp` **for youtube obviously**; local playback needs neither
-- astats lavfi filter for visualizer via `ffmpeg`
+- astats lavfi filter for visualizer (ffmpeg inside mpv)
 - outbound calls only: never listens on a socket
 
 ## version
-<b>v0.1.7</b> dropping out the `ytcli` name; it's a media player now and youtube is only one source
+<b>v0.1.8</b> visualizers, mouse, and installs anywhere mpv does
+- **libmpv loads at runtime** instead of being linked: one binary per platform, and intel macs get a release again (universal macOS binary)
+- no mpv? `hum` still starts, searches and browses, and tells you to install mpv instead of failing to launch
+- **mp3 durations**: local mp3s without a `TLEN` tag showed `00:00`; length now comes from the Xing/Info header, or bytes ÷ bitrate for CBR. existing library rows refresh on the next scan
+- **linux media keys / status bars** (MPRIS): install `mpv-mpris` and hum shows up in waybar, polybar, gnome, kde
+- now-playing widgets (macOS Now Playing, MPRIS) show the track title instead of a stream URL
+- `hum doctor` reports where libmpv was found and flags a stale `yt-dlp`; the TUI says so too when a youtube track fails because of it
+- **visualizer view** (`Ctrl+V`): the visualizer takes over the main box while now playing stays below, and the queue sits beside it on wide terminals. five built in: bars, cube, orbit, rings, plasma. `v`/`V` cycles them. they follow your theme and react to loudness, left/right balance and brightness (treble). resize all you want; it lays out fresh every frame
+- **your own visualizers**: drop a `.vis` text file (ascii frames + a few `key = value` lines) in `~/.config/hum/visualizers/` and it joins the cycle. see [`examples/visualizers/pulse.vis`](examples/visualizers/pulse.vis)
+- **mouse**: wheel scrolls lists, click selects, click again plays, click the progress bar to seek, click `both`/`youtube`/`library` and `all`/`songs`/… to switch scope and filter. in the visualizer: left/right click cycles, the queue panel plays on click and reorders by drag. `mouse=off` in the config turns it off (hold `shift`, or `option` in macOS Terminal, to select text while it's on)
+- **paste**: pasting into search goes in as text (bracketed paste), so a pasted newline or escape code can't fire keys
+- **zig 0.17**: builds with current zig (and homebrew's), no more C header imports anywhere
+- `brew install zblauser/tap/hum` installs the prebuilt binary instead of compiling: intel macs no longer build zig (and LLVM) from source first
+
+<details>
+<summary>previous</summary><br>
+
+<b>v0.1.7</b><br>
+dropping out the `ytcli` name; it's a media player now and youtube is only one source
 - **renamed**: the binary is `hum`. your existing history, playlists and config keep working; it does read the old `ytcli/` config/data dirs when the new `hum/` ones aren't present
 - **local files**: `hum ~/Music/album/01.flac` plays a file; `http(s)://` URL streams
 - **local library**: `hum library dir ~/Music`, then `Ctrl+L` in the TUI browses artists → albums → tracks
@@ -29,9 +47,6 @@ zig 0.16, single binary
 - scanning is on demand with progress, and any key stops it (a stopped scan is never cached as if complete)
 - fix: search rows showed a duration where the artist belongs (top-result rows come from a card shelf that carries the artist in its header)
 - dropped: cookie/SAPISIDHASH personalization. not worth the credential surface
-
-<details>
-<summary>previous</summary><br>
 
 <b>v0.1.6</b><br>
 - fix crash on non-UTF-8 autocomplete (the suggest endpoint answers in latin-1 without `ie`/`oe=utf-8`)
@@ -84,24 +99,28 @@ zig 0.16, single binary
 + handful of color themes
 </details>
 
-## build/install
+## install
 ```sh
-zig build                              # → zig-out/bin/hum
-zig build install --prefix ~/.local    # → ~/.local/bin/hum
+brew install zblauser/tap/hum          # macOS / linuxbrew: prebuilt binary + mpv + yt-dlp, nothing to compile
 ```
+or grab a binary from [releases](../../releases): macOS (universal), Linux (arm64/x86_64), FreeBSD. windows: run under WSL (no native build just yet).
+
 ## dependencies
 
 ```sh
-brew install mpv ffmpeg                # macOS (mpv pulls in yt-dlp)
-apt install libmpv-dev yt-dlp ffmpeg   # Debian/Ubuntu
+brew install mpv                       # macOS (mpv pulls in yt-dlp)
+apt install libmpv2 yt-dlp             # Debian/Ubuntu
+apt install mpv-mpris                  # optional: media keys + status bar widgets on linux
 ```
 <br>
 
-> **[ ! ]** currently requires `mpv`, `ffmpeg` and `yt-dlp` particularly on PATH (try and keep your `yt-dlp` updated, youtube breaks old versions)
+> **[ ! ]** `libmpv` plays everything; `yt-dlp` is only for youtube (try and keep it updated, youtube breaks old versions). `hum doctor` checks both
 
-## releases
-
-macOS (universal: arm64 + x86_64), Linux (arm64/x86_64), and FreeBSD binaries are attached to each [release](../../releases). windows: run under WSL (no native build just yet).
+## build
+```sh
+zig build                              # → zig-out/bin/hum (needs only zig 0.17, not mpv)
+zig build install --prefix ~/.local    # → ~/.local/bin/hum
+```
 
 ## run
 ```sh
@@ -171,6 +190,17 @@ made an effort to use commands that felt fairly intuitive
 | | `m` | Mute |
 | | `Ctrl+R` | Cycle repeat mode (off/track/queue) |
 | | `Ctrl+Y` | Cycle theme |
+| | `Ctrl+V` | Visualizer view (`esc` or `Ctrl+V` again to leave) |
+| **Visualizer (`Ctrl+V`)** | `v` / `V` | Next / previous visualizer (remembered) |
+| | `↑` / `↓` | Volume up / down |
+| | `←` / `→` | Seek backward / forward 10 seconds |
+| **Mouse** | wheel | Move the selection (volume in the visualizer) |
+| | click | Select a row; click it again to play or open it |
+| | click the progress bar | Jump to that point in the track |
+| | left / right click the visualizer | Next / previous visualizer |
+| | click a queue-panel track | Play it |
+| | drag a track onto another | Move it there (queue panel and `Ctrl+Q`) |
+| | click a scope or filter label | Switch to it |
 
 </details>
 
@@ -179,7 +209,8 @@ made an effort to use commands that felt fairly intuitive
 - `$XDG_DATA_HOME/hum/log` - timestamped failures (search/album/stream) with the underlying error and any `curl`/`yt-dlp` stderr. check here first when something says `(see log)`.
 - `$XDG_DATA_HOME/hum/playlists` - saved playlists: `[name]` header, then one `target⇥title⇥artist⇥kind⇥source⇥duration` line per track (`target` is a video id, or a path for local files). tab-separated, editable by hand. files written by older versions still load.
 - `$XDG_CACHE_HOME/hum/library` - the local index. rebuildable. delete it and `hum library scan`. rows are reused when a file's mtime and size are unchanged, so a rescan only re-reads what actually changed.
-- `$XDG_CONFIG_HOME/hum/config` - `key=value` settings (theme, volume, `music_dir`).
+- `$XDG_CONFIG_HOME/hum/config` - `key=value` settings (theme, volume, `music_dir`, `visualizer`, `mouse=off`, `splash=off`).
+- `$XDG_CONFIG_HOME/hum/visualizers/*.vis` - your own visualizers. header lines `name`, `fps` (1-30), `speed` (`fixed`/`level`), `color` (`level`/`dim`/`accent`/`strong`), then frames separated by `---` lines. up to 32 files, 64KB each; a file that doesn't parse is skipped and noted in the log
 - history is just newline delimited text - `grep`/`cat` it, or seed it so the TUI autocompletes your favorites from the first keystroke:
 ```sh
 printf '%s\n' "elephant gym" "autechre" "john zorn" >> ~/.local/share/hum/history
@@ -192,8 +223,15 @@ grep -i jazz ~/.local/share/hum/history
 > [ ! ] requests written to `/tmp/hum_body*` (mkstemp, 0600, unlinked after) per call + audio streamed/buffered via mpv; not written to disk.
 
 ## visualizer
-simple spectrum bars via `astats` lavfi filter<br>
-dB to linear/modulated per bar | *not a true per-band FFT*
+<p align="center">
+  <img src="assets/visualizers.gif" alt="hum's visualizer view cycling bars, cube, orbit, rings, plasma and a custom flipbook" width="82%"/>
+</p>
+
+full screen the visualizer using `Ctrl+V` while something plays. `v`/`V` cycles bars, cube, orbit, rings, plasma and any `.vis` files you've added; left/right click on the visualizer does the same. the queue on the right is clickable (play) and draggable (reorder)<br>
+
+mpv's `astats` lavfi filter reports loudness, per-channel level and the zero-crossing rate (a stand-in for brightness/treble) every 50ms; the visualizers are driven by those<br>
+
+*not a true per-band FFT*: the bars are modulated by loudness, not split by frequency
 
 ## contribution
 please feel free to contribute, not a guarantee it will be merged, but a guarantee a human will look at it<br>
