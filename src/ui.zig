@@ -1,11 +1,11 @@
 const std = @import("std");
-const posix = std.posix;
 
 const fsutil = @import("fsutil.zig");
-const c = fsutil.c;
+const term = @import("term.zig");
 
 const api = @import("api.zig");
 const stream = @import("stream.zig");
+const art_mod = @import("art.zig");
 const player = @import("player.zig");
 const suggest = @import("suggest.zig");
 const history = @import("history.zig");
@@ -20,18 +20,25 @@ const log = @import("log.zig");
 const vis = @import("vis.zig");
 const VERSION = @import("build_options").version;
 
-const STDIN: posix.fd_t = 0;
-const STDOUT: posix.fd_t = 1;
-
+const RESTORE_SEQ = MOUSE_OFF ++ PASTE_OFF ++ "\x1b[?25h\x1b[?1049l";
 const SUGGEST_DEBOUNCE_MS: i32 = 250;
 const MAX_SUGGESTIONS: usize = 24;
 const MAX_LOCAL_HITS: usize = 12;
 const MAX_LIB_NAMES: usize = 8;
 const MAX_RESULTS: usize = 50;
-const VIS_BARS: usize = 28;
+const MAX_NAV: usize = 16;
+
+const NavFrame = struct {
+    tracks: []api.Track,
+    sel: usize,
+    scroll: usize,
+    crumb: []const u8,
+    more: api.More,
+};
 const TICK_MS_PLAYING: i32 = 100;
 const TICK_MS_IDLE: i32 = 250;
 const TICK_MS_VIS: i32 = vis.TICK_MS;
+const VIS_LABEL_TICKS: u64 = 2000 / vis.TICK_MS;
 const MAX_FLIPBOOKS = 32;
 const QUEUE_PANEL_COLS = 30;
 const MOUSE_ON = "\x1b[?1000h\x1b[?1006h";
@@ -136,6 +143,17 @@ const State = struct {
     theme_idx: usize = 0,
 
     pl: ?*player.Player = null,
+    pl_opts: player.Player.Options = .{},
+    next: ?*stream.Prefetch = null,
+    next_queued: bool = false,
+    autoplay: bool = true,
+    art_job: ?*art_mod.Job = null,
+    lyrics_view: bool = false,
+    lyrics_job: ?*api.LyricsJob = null,
+    lyrics_scroll: usize = 0,
+    lyrics_manual: bool = false,
+    radio_seed: [16]u8 = undefined,
+    radio_seed_len: usize = 0,
     queue: []api.Track = &.{},
     queue_idx: usize = 0,
     queue_sel: usize = 0,
@@ -154,6 +172,12 @@ const State = struct {
     body_rows: usize = 0,
     np_top: usize = 0,
     np_bar_cols: usize = 0,
+    np_label_cols: usize = 0,
+    np_vol_x: usize = 0,
+    np_arc_row: ?usize = null,
+    np_next_row: ?usize = null,
+    hint: []const u8 = "",
+    hint_row: usize = 0,
     mode_row: ?usize = null,
     mode_hits: [MAX_MODE_HITS]ModeHit = undefined,
     mode_hit_len: usize = 0,
@@ -163,14 +187,19 @@ const State = struct {
     drag_from: ?usize = null,
     vis_view: bool = false,
     vis_idx: usize = 0,
+    vis_label_at: ?u64 = null,
     vis_motion: vis.Motion = .{},
     vis_bufs: vis.Buffers = .{},
-    vis_audio: vis.Audio = .{},
+    vis_meter: vis.Meter = .{},
     vis_audio_tick: u64 = 0,
     flipbooks: []const vis.Flipbook = &.{},
     vis_arena: std.heap.ArenaAllocator = undefined,
 
     search_arena: std.heap.ArenaAllocator = undefined,
+    nav: [MAX_NAV]NavFrame = undefined,
+    nav_len: usize = 0,
+    yt_crumb: []const u8 = "",
+    more: api.More = .none,
 
     sug_arena: std.heap.ArenaAllocator = undefined,
 
@@ -195,17 +224,15 @@ pub fn run(
     theme: theme_mod.Theme,
     theme_idx: usize,
 ) !void {
-    const orig_termios = try enterRaw();
-    defer restoreTty(orig_termios);
+    const orig_termios = try term.enterRaw();
+    defer term.restore(orig_termios);
+    term.exitOnInterrupt(RESTORE_SEQ);
 
-    saved_termios = orig_termios;
-    installInterruptHandlers();
-
-    try writeAll("\x1b[?1049h\x1b[?25l");
-    defer writeAll("\x1b[?25h\x1b[?1049l") catch {};
+    try term.writeAll("\x1b[?1049h\x1b[?25l");
+    defer term.writeAll("\x1b[?25h\x1b[?1049l") catch {};
 
     {
-        const sz = termSize();
+        const sz = term.size();
         log.write("start: term {d}x{d} rows/cols", .{ sz.rows, sz.cols });
     }
     var state: State = .{ .theme = theme, .theme_idx = theme_idx };
@@ -235,14 +262,19 @@ pub fn run(
         }
         state.music_dir = config.loadKey(arena, state.config_path, .music_dir) orelse "";
         if (config.loadKey(arena, state.config_path, .scope)) |sc| state.scope = Scope.byName(sc);
+        if (config.loadKey(arena, state.config_path, .filter)) |f| state.filter = std.meta.stringToEnum(api.Filter, f) orelse .all;
+        if (state.scope == .library and state.filter == .videos) state.filter = .all;
     }
     if (state.config_path.len > 0) {
         if (config.loadKey(arena, state.config_path, .mouse)) |m| state.mouse = !std.mem.eql(u8, m, "off");
+        if (config.loadKey(arena, state.config_path, .gapless)) |g| state.pl_opts.gapless = !std.mem.eql(u8, g, "off");
+        if (config.loadKey(arena, state.config_path, .replaygain)) |r| state.pl_opts.replaygain = replaygainMode(r);
+        if (config.loadKey(arena, state.config_path, .autoplay)) |ap| state.autoplay = !std.mem.eql(u8, ap, "off");
     }
-    if (state.mouse) writeAll(MOUSE_ON) catch {};
-    defer if (state.mouse) writeAll(MOUSE_OFF) catch {};
-    writeAll(PASTE_ON) catch {};
-    defer writeAll(PASTE_OFF) catch {};
+    if (state.mouse) term.writeAll(MOUSE_ON) catch {};
+    defer if (state.mouse) term.writeAll(MOUSE_OFF) catch {};
+    term.writeAll(PASTE_ON) catch {};
+    defer term.writeAll(PASTE_OFF) catch {};
     state.vis_arena = std.heap.ArenaAllocator.init(gpa);
     state.flipbooks = loadFlipbooks(state.vis_arena.allocator(), io, state.config_path);
     if (state.config_path.len > 0) {
@@ -266,6 +298,9 @@ pub fn run(
         state.hist_arena.deinit();
         state.vis_bufs.deinit(gpa);
         state.vis_arena.deinit();
+        dropNext(&state);
+        if (state.art_job) |j| j.release();
+        if (state.lyrics_job) |j| j.release();
         if (state.pl) |p| {
             p.deinit();
             gpa.destroy(p);
@@ -284,9 +319,13 @@ pub fn run(
                 if (ev == .none) break;
                 handlePlayerEvent(gpa, arena, io, &state, ev) catch |err| survive(&state, "player event", err);
             }
+            autoRadio(gpa, io, &state);
+            syncArt(gpa, io, &state);
+            syncLyrics(gpa, io, &state);
+            syncNext(gpa, io, &state);
         }
 
-        if (try waitInput(timeout)) {
+        if (injected != null or try term.waitInput(timeout)) {
             const cont = handleKey(gpa, arena, io, &state) catch |err| blk: {
                 survive(&state, "key", err);
                 break :blk true;
@@ -311,7 +350,7 @@ fn showSplash(th: theme_mod.Theme) !void {
         "╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝",
     };
     const art_cols: usize = 28;
-    const sz = termSize();
+    const sz = term.size();
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.heap.page_allocator);
@@ -345,25 +384,19 @@ fn showSplash(th: theme_mod.Theme) !void {
         while (k < ver_pad) : (k += 1) try buf.append(a, ' ');
         try buf.print(a, "{s}{s}{s}\r\n", .{ th.dim, ver, th.reset });
     }
-    try writeAll(buf.items);
+    try term.writeAll(buf.items);
 
-    if (waitInput(SPLASH_MS) catch false) {
+    if (term.waitInput(SPLASH_MS) catch false) {
         var key_buf: [8]u8 = undefined;
         _ = readKey(&key_buf) catch {};
     }
-    try writeAll("\x1b[2J\x1b[H");
+    try term.writeAll("\x1b[2J\x1b[H");
 }
 
 fn survive(state: *State, what: []const u8, err: anyerror) void {
     log.write("{s} failed: {s} phase={s}", .{ what, @errorName(err), @tagName(state.phase) });
     if (err == error.MpvMissing) return setStatus(state, "libmpv not found: install mpv", .{});
     setStatus(state, "{s} failed: {s} (see log)", .{ what, @errorName(err) });
-}
-
-fn waitInput(timeout_ms: i32) !bool {
-    var fds = [_]posix.pollfd{.{ .fd = STDIN, .events = posix.POLL.IN, .revents = 0 }};
-    const n = try posix.poll(&fds, timeout_ms);
-    return n > 0 and (fds[0].revents & posix.POLL.IN) != 0;
 }
 
 const Key = union(enum) {
@@ -407,15 +440,16 @@ const ModeHit = struct {
 };
 
 var paste_buf: [MAX_PASTE]u8 = undefined;
+var injected: ?Key = null;
 
 fn readPaste() !Key {
     const end = "\x1b[201~";
     var n: usize = 0;
     var matched: usize = 0;
     while (true) {
-        if (!(try waitInput(200))) break;
+        if (!(try term.waitInput(200))) break;
         var one: [1]u8 = undefined;
-        if ((try posix.read(STDIN, &one)) == 0) break;
+        if ((try term.read(&one)) == 0) break;
         if (one[0] == end[matched]) {
             matched += 1;
             if (matched == end.len) break;
@@ -438,9 +472,9 @@ fn readMouse() !Key {
     var buf: [24]u8 = undefined;
     var n: usize = 0;
     while (n < buf.len) {
-        if (!(try waitInput(20))) return .unknown;
+        if (!(try term.waitInput(20))) return .unknown;
         var one: [1]u8 = undefined;
-        if ((try posix.read(STDIN, &one)) == 0) return .unknown;
+        if ((try term.read(&one)) == 0) return .unknown;
         if (one[0] == 'M' or one[0] == 'm') {
             var it = std.mem.splitScalar(u8, buf[0..n], ';');
             const b = std.fmt.parseInt(u16, it.next() orelse return .unknown, 10) catch return .unknown;
@@ -456,7 +490,7 @@ fn readMouse() !Key {
 
 fn readKey(buf: *[8]u8) !Key {
     var one: [1]u8 = undefined;
-    if ((try posix.read(STDIN, &one)) == 0) return .unknown;
+    if ((try term.read(&one)) == 0) return .unknown;
     const b = one[0];
     switch (b) {
         0x03, 0x04 => return .ctrl_c,
@@ -471,7 +505,7 @@ fn readKey(buf: *[8]u8) !Key {
             var i: usize = 1;
             while (i <= n_cont) : (i += 1) {
                 var more: [1]u8 = undefined;
-                if ((try posix.read(STDIN, &more)) == 0) break;
+                if ((try term.read(&more)) == 0) break;
                 buf[i] = more[0];
             }
             return Key{ .text = buf[0 .. n_cont + 1] };
@@ -480,19 +514,19 @@ fn readKey(buf: *[8]u8) !Key {
 }
 
 fn readEscape(_: *[8]u8) !Key {
-    if (!(try waitInput(20))) return .escape;
+    if (!(try term.waitInput(20))) return .escape;
     var c1: [1]u8 = undefined;
-    if ((try posix.read(STDIN, &c1)) == 0) return .escape;
+    if ((try term.read(&c1)) == 0) return .escape;
     if (c1[0] != '[' and c1[0] != 'O') return .escape;
-    if (!(try waitInput(20))) return .escape;
+    if (!(try term.waitInput(20))) return .escape;
     var c2: [1]u8 = undefined;
-    if ((try posix.read(STDIN, &c2)) == 0) return .escape;
+    if ((try term.read(&c2)) == 0) return .escape;
     if (c2[0] == '<') return readMouse();
     if (c2[0] == '2') {
         var tail: [3]u8 = undefined;
         for (&tail, 0..) |*b, i| {
-            if (!(try waitInput(20))) return .unknown;
-            if ((try posix.read(STDIN, b[0..1])) == 0) return .unknown;
+            if (!(try term.waitInput(20))) return .unknown;
+            if ((try term.read(b[0..1])) == 0) return .unknown;
             if (b.* == '~' and i < 2) return .unknown;
         }
         return if (std.mem.eql(u8, &tail, "00~")) readPaste() else .unknown;
@@ -506,12 +540,12 @@ fn readEscape(_: *[8]u8) !Key {
         'F' => .end,
         '5' => blk: {
             var t: [1]u8 = undefined;
-            _ = posix.read(STDIN, &t) catch 0;
+            _ = term.read(&t) catch 0;
             break :blk .page_up;
         },
         '6' => blk: {
             var t: [1]u8 = undefined;
-            _ = posix.read(STDIN, &t) catch 0;
+            _ = term.read(&t) catch 0;
             break :blk .page_down;
         },
         else => .unknown,
@@ -525,7 +559,10 @@ fn handleKey(
     state: *State,
 ) !bool {
     var buf: [8]u8 = undefined;
-    const key = readKey(&buf) catch return true;
+    const key = if (injected) |k| blk: {
+        injected = null;
+        break :blk k;
+    } else readKey(&buf) catch return true;
 
     switch (key) {
         .ctrl => |b| switch (b) {
@@ -570,7 +607,18 @@ fn handleKey(
                     state.vis_view = false;
                 } else if (state.now_track != null) {
                     state.vis_view = true;
+                    state.lyrics_view = false;
+                    state.vis_label_at = state.tick;
                 } else state.status = "nothing playing to visualize";
+                return true;
+            },
+            0x0b => {
+                if (state.lyrics_view) {
+                    state.lyrics_view = false;
+                } else if (state.now_track != null) {
+                    state.lyrics_view = true;
+                    state.vis_view = false;
+                } else state.status = "nothing playing";
                 return true;
             },
             0x19 => {
@@ -595,6 +643,7 @@ fn handleKey(
         return dispatchPhase(gpa, arena, io, state, .{ .text = clean });
     }
     if (state.vis_view and state.now_track != null) return handleVis(arena, state, key);
+    if (state.lyrics_view and state.now_track != null) return handleLyrics(arena, state, key);
 
     return switch (state.phase) {
         .typing => try handleTyping(gpa, arena, io, state, key),
@@ -642,7 +691,7 @@ fn handleTyping(
             0x0C => try openLibrary(gpa, io, state, false),
             0x06 => try openFeeds(gpa, io, state),
             0x11 => openQueue(state),
-            0x14 => setFilter(state, switch (state.filter) {
+            0x14 => setFilter(arena, state, switch (state.filter) {
                 .all => .songs,
                 .songs => if (state.scope == .library) .albums else .videos,
                 .videos => .albums,
@@ -713,14 +762,14 @@ fn handleResults(
     const max_idx = if (n == 0) 0 else n - 1;
     switch (key) {
         .ctrl_c => return false,
-        .escape => if (state.in_library) try libraryBack(state) else if (state.in_feeds) try feedsBack(gpa, io, state) else backToTyping(state),
+        .escape => try resultsBack(gpa, io, state),
         .up => if (state.sel_track > 0) {
             state.sel_track -= 1;
         },
         .down => if (state.sel_track + 1 < n) {
             state.sel_track += 1;
         },
-        .left => if (state.in_library) try libraryBack(state) else if (state.in_feeds) try feedsBack(gpa, io, state) else backToTyping(state),
+        .left => try resultsBack(gpa, io, state),
         .right => try activateSelected(gpa, arena, io, state),
         .page_down => state.sel_track = @min(state.sel_track + 10, max_idx),
         .page_up => state.sel_track = if (state.sel_track > 10) state.sel_track - 10 else 0,
@@ -744,11 +793,12 @@ fn handleResults(
                     'k' => if (state.sel_track > 0) {
                         state.sel_track -= 1;
                     },
-                    'h' => if (state.in_library) try libraryBack(state) else if (state.in_feeds) try feedsBack(gpa, io, state) else backToTyping(state),
+                    'h' => try resultsBack(gpa, io, state),
                     'P' => openPicker(state, if (state.tracks.len > 0) state.tracks[state.sel_track] else null),
                     's' => queueShuffle(state),
                     'a' => try queueAdd(state, false),
                     'A' => try queueAdd(state, true),
+                    'R' => try startRadio(gpa, arena, io, state),
                     'd' => if (state.view_pl != null) removeFromPlaylist(gpa, state),
                     'l' => try activateSelected(gpa, arena, io, state),
                     'g' => state.sel_track = 0,
@@ -764,6 +814,8 @@ fn handleResults(
 
 fn backToTyping(state: *State) void {
     state.phase = .typing;
+    state.nav_len = 0;
+    state.yt_crumb = "";
     state.in_library = false;
     state.in_feeds = false;
     state.feed_title = "";
@@ -1106,10 +1158,9 @@ fn runSearch(gpa: std.mem.Allocator, io: std.Io, state: *State) !void {
 
     if (state.scope == .library) return runLibrarySearch(state, q_src);
 
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
 
-    const tracks = api.searchFiltered(sa, gpa, io, q_src, MAX_RESULTS, state.filter) catch |err| {
+    const page = api.searchPage(sa, gpa, io, q_src, MAX_RESULTS, state.filter) catch |err| {
         log.write("search failed: {s} query=\"{s}\" filter={s}", .{ @errorName(err), q_src, state.filter.label() });
         state.status = switch (err) {
             error.NoResult => "no results",
@@ -1124,11 +1175,112 @@ fn runSearch(gpa: std.mem.Allocator, io: std.Io, state: *State) !void {
         reloadHistory(state);
     }
 
-    state.tracks = tracks;
+    state.more = page.more;
+    state.tracks = try withMoreRow(sa, page.tracks, page.more);
     state.sel_track = 0;
     state.scroll_track = 0;
     state.phase = .results;
-    state.status = "↑↓/jk pick · g/G ⌂⌃ · ⏎/l play · h back";
+    state.status = "↑↓/jk pick · g/G ⌂⌃ · ⏎/l play or open · h back";
+}
+
+fn resetSearch(state: *State) std.mem.Allocator {
+    state.nav_len = 0;
+    state.yt_crumb = "";
+    state.more = .none;
+    _ = state.search_arena.reset(.retain_capacity);
+    return state.search_arena.allocator();
+}
+
+fn withMoreRow(a: std.mem.Allocator, rows: []api.Track, more: api.More) ![]api.Track {
+    if (more == .none) return rows;
+    const out = try a.alloc(api.Track, rows.len + 1);
+    @memcpy(out[0..rows.len], rows);
+    out[rows.len] = .{ .title = if (more == .songs) "more songs" else "more results", .artist = "", .kind = "More" };
+    return out;
+}
+
+fn isMoreRow(t: api.Track) bool {
+    return std.mem.eql(u8, t.kind, "More") and t.browse_id.len == 0;
+}
+
+fn pushNav(state: *State) void {
+    if (state.nav_len == MAX_NAV) {
+        std.mem.copyForwards(NavFrame, state.nav[0 .. MAX_NAV - 1], state.nav[1..]);
+        state.nav_len -= 1;
+    }
+    state.nav[state.nav_len] = .{
+        .tracks = state.tracks,
+        .sel = state.sel_track,
+        .scroll = state.scroll_track,
+        .crumb = state.yt_crumb,
+        .more = state.more,
+    };
+    state.nav_len += 1;
+}
+
+fn popNav(state: *State) bool {
+    if (state.nav_len == 0) return false;
+    state.nav_len -= 1;
+    const f = state.nav[state.nav_len];
+    state.tracks = f.tracks;
+    state.sel_track = f.sel;
+    state.scroll_track = f.scroll;
+    state.yt_crumb = f.crumb;
+    state.more = f.more;
+    state.status = "⏎/l play or open · h back";
+    return true;
+}
+
+fn resultsBack(gpa: std.mem.Allocator, io: std.Io, state: *State) !void {
+    if (popNav(state)) return;
+    if (state.in_library) return libraryBack(state);
+    if (state.in_feeds) return feedsBack(gpa, io, state);
+    backToTyping(state);
+}
+
+fn openBrowse(gpa: std.mem.Allocator, io: std.Io, state: *State, t: api.Track) !void {
+    setStatus(state, "loading {s}…", .{kindShort(t.kind)});
+    try draw(gpa, state);
+    const sa = state.search_arena.allocator();
+    const page = api.browsePage(sa, gpa, io, t.browse_id) catch |err| {
+        log.write("browse failed: {s} browse_id={s} kind={s} title=\"{s}\"", .{ @errorName(err), t.browse_id, t.kind, t.title });
+        setStatus(state, "{s} load failed (see log)", .{kindShort(t.kind)});
+        return;
+    };
+    const base = if (state.yt_crumb.len > 0) state.yt_crumb else std.mem.trim(u8, state.query.items, " \t");
+    const crumb = try std.fmt.allocPrint(sa, "{s} › {s}", .{ base, t.title });
+    const rows = try withMoreRow(sa, page.tracks, page.more);
+    pushNav(state);
+    state.yt_crumb = crumb;
+    state.more = page.more;
+    state.tracks = rows;
+    state.sel_track = 0;
+    state.scroll_track = 0;
+    state.status = "⏎/l play or open · h back";
+}
+
+fn loadMore(gpa: std.mem.Allocator, io: std.Io, state: *State) !void {
+    if (state.more == .none) return;
+    state.status = "loading more…";
+    try draw(gpa, state);
+    const sa = state.search_arena.allocator();
+    const page = api.morePage(sa, gpa, io, state.more, MAX_RESULTS) catch |err| {
+        log.write("load more failed: {s} kind={s}", .{ @errorName(err), @tagName(state.more) });
+        state.status = switch (err) {
+            error.NoResult => "no more results",
+            else => "load more failed (see log)",
+        };
+        return;
+    };
+    const shown = if (state.tracks.len > 0 and isMoreRow(state.tracks[state.tracks.len - 1]))
+        state.tracks[0 .. state.tracks.len - 1]
+    else
+        state.tracks;
+    const merged = try api.merge(sa, shown, page.tracks);
+    state.more = page.more;
+    state.tracks = try withMoreRow(sa, merged, page.more);
+    state.sel_track = @min(shown.len, state.tracks.len -| 1);
+    setStatus(state, "+{d} · {d} shown", .{ merged.len - shown.len, merged.len });
 }
 
 fn runLibrarySearch(state: *State, query: []const u8) !void {
@@ -1141,8 +1293,7 @@ fn runLibrarySearch(state: *State, query: []const u8) !void {
         return;
     }
 
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
 
     const rows: []api.Track = switch (state.filter) {
         .albums => blk: {
@@ -1223,6 +1374,138 @@ fn mediaKey(arena: std.mem.Allocator, state: *State, ch: u8) bool {
     return true;
 }
 
+fn handleLyrics(arena: std.mem.Allocator, state: *State, key: Key) bool {
+    switch (key) {
+        .ctrl_c => return false,
+        .escape => state.lyrics_view = false,
+        .up => lyricsScroll(state, -1),
+        .down => lyricsScroll(state, 1),
+        .page_up => lyricsScroll(state, -10),
+        .page_down => lyricsScroll(state, 10),
+        .text => |t| if (t.len == 1) switch (t[0]) {
+            'k' => lyricsScroll(state, -1),
+            'j' => lyricsScroll(state, 1),
+            'f' => state.lyrics_manual = false,
+            'q' => state.lyrics_view = false,
+            else => _ = mediaKey(arena, state, t[0]),
+        },
+        else => {},
+    }
+    return true;
+}
+
+fn lyricsScroll(state: *State, by: isize) void {
+    state.lyrics_manual = true;
+    state.lyrics_scroll = if (by < 0) state.lyrics_scroll -| @abs(by) else state.lyrics_scroll + @abs(by);
+}
+
+fn syncLyrics(gpa: std.mem.Allocator, io: std.Io, state: *State) void {
+    if (!state.lyrics_view) return;
+    const t = state.now_track orelse return;
+    if (state.lyrics_job) |j| {
+        if (j.matches(t)) return;
+        j.release();
+        state.lyrics_job = null;
+    }
+    state.lyrics_scroll = 0;
+    state.lyrics_manual = false;
+    state.lyrics_job = api.LyricsJob.start(gpa, io, t) catch null;
+}
+
+fn drawLyricsView(gpa: std.mem.Allocator, state: *State, width: usize, height: usize) !void {
+    const need: usize = width * height * 16 + 4096;
+    if (state.draw_buf.capacity < need) try state.draw_buf.ensureTotalCapacity(gpa, need);
+    state.draw_buf.clearRetainingCapacity();
+    var w: std.Io.Writer = .fixed(state.draw_buf.allocatedSlice());
+    const th = state.theme;
+    try w.writeAll("\x1b[?2026h\x1b[H");
+    if (width < 30 or height < 10) {
+        try w.print("\x1b[2J\x1b[{d};1H{s}too small{s}\x1b[?2026l", .{ height / 2, th.dim, th.reset });
+        return term.writeAll(w.buffered());
+    }
+
+    const inner = width - 2;
+    const np_rows: usize = if (height >= 16) 5 else 4;
+    const body_h = height - np_rows - 1 - 2;
+    const text_w = inner - 2;
+    try boxTop(&w, th, inner, " ♫ hum · lyrics ");
+    state.mode_row = null;
+    state.vis_rect = .{};
+    state.panel_rect = .{};
+
+    const t = state.now_track.?;
+    const job = state.lyrics_job;
+    const body: []const u8 = blk: {
+        const j = job orelse break :blk "loading lyrics…";
+        if (!j.matches(t) or !j.ready()) break :blk "loading lyrics…";
+        if (j.result()) |txt| break :blk txt;
+        break :blk if (j.err == error.NoLyrics or j.err == error.NoResult) "no lyrics for this one" else "lyrics failed (see log)";
+    };
+
+    var total: usize = 0;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| total += wrapCount(line, text_w);
+    const max_scroll = total -| body_h;
+    if (!state.lyrics_manual) {
+        const p = state.pl;
+        const pos = if (p) |pl| pl.timePos() orelse 0 else 0;
+        const dur = if (p) |pl| pl.duration() orelse 0 else 0;
+        const frac = if (dur > 0) std.math.clamp(pos / dur, 0, 1) else 0;
+        const at: usize = @intFromFloat(frac * @as(f64, @floatFromInt(total)));
+        state.lyrics_scroll = at -| body_h / 3;
+    }
+    state.lyrics_scroll = @min(state.lyrics_scroll, max_scroll);
+
+    var row: usize = 0;
+    var skip = state.lyrics_scroll;
+    it = std.mem.splitScalar(u8, body, '\n');
+    outer: while (it.next()) |line| {
+        var rest = line;
+        const muted = std.mem.startsWith(u8, line, "Source: ");
+        while (true) {
+            const piece = truncateCols(rest, text_w);
+            rest = rest[piece.len..];
+            if (skip > 0) {
+                skip -= 1;
+            } else {
+                if (row == body_h) break :outer;
+                const cols = visibleCols(piece);
+                const pad = (text_w - cols) / 2;
+                try w.print("{s}│{s} ", .{ th.accent, th.reset });
+                try w.splatByteAll(' ', pad);
+                try w.print("{s}{s}{s}", .{ if (muted) th.dim else "", piece, th.reset });
+                try w.splatByteAll(' ', text_w - cols - pad);
+                try w.print(" {s}│{s}\r\n", .{ th.accent, th.reset });
+                row += 1;
+            }
+            if (rest.len == 0 or piece.len == 0) break;
+        }
+    }
+    while (row < body_h) : (row += 1) {
+        try w.print("{s}│{s}", .{ th.accent, th.reset });
+        try w.splatByteAll(' ', inner);
+        try w.print("{s}│{s}\r\n", .{ th.accent, th.reset });
+    }
+    try boxBottom(&w, th, inner);
+    state.np_top = height - np_rows - 1;
+    try drawNowPlaying(gpa, &w, th, inner, state, np_rows, false);
+    const hint = if (state.lyrics_manual) "j/k scroll · f follow · ^K/esc back · ␣ pause · -/= vol" else "j/k scroll · ^K/esc back · ␣ pause · -/= vol · [/] seek";
+    try drawHint(&w, th, state, hint, width, height);
+    try w.writeAll("\x1b[J\x1b[?2026l");
+    try term.writeAll(w.buffered());
+}
+
+fn wrapCount(line: []const u8, cols: usize) usize {
+    var n: usize = 0;
+    var rest = line;
+    while (true) {
+        n += 1;
+        const piece = truncateCols(rest, cols);
+        rest = rest[piece.len..];
+        if (rest.len == 0 or piece.len == 0) return n;
+    }
+}
+
 fn handleVis(arena: std.mem.Allocator, state: *State, key: Key) bool {
     switch (key) {
         .ctrl_c => return false,
@@ -1253,10 +1536,11 @@ fn setScope(arena: std.mem.Allocator, state: *State, scope: Scope) void {
     saveSetting(arena, state, .scope, scope.label());
 }
 
-fn setFilter(state: *State, filter: api.Filter) void {
+fn setFilter(arena: std.mem.Allocator, state: *State, filter: api.Filter) void {
     state.filter = if (state.scope == .library and filter == .videos) .all else filter;
     state.status = state.filter.label();
     if (state.scope == .library) refreshLocalHits(state);
+    saveSetting(arena, state, .filter, state.filter.label());
 }
 
 fn dispatchPhase(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, state: *State, key: Key) !bool {
@@ -1274,9 +1558,19 @@ fn handleMouse(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, sta
     const col: usize = m.x -| 1;
     const vis_on = state.vis_view and state.now_track != null;
 
+    if (state.lyrics_view and state.now_track != null) {
+        if (base == 64 or base == 65) {
+            lyricsScroll(state, if (base == 64) -3 else 3);
+            return true;
+        }
+        if (row < state.np_top) return true;
+    }
+
     if (base == 64 or base == 65) {
         const up = base == 64;
-        if (vis_on and state.panel_rect.contains(col, row)) {
+        if (state.np_bar_cols > 0 and row >= state.np_top and row < state.hint_row) {
+            _ = mediaKey(arena, state, if (up) '=' else '-');
+        } else if (vis_on and state.panel_rect.contains(col, row)) {
             const first = panelFirst(state);
             state.panel_top = if (up) first -| 1 else @min(first + 1, state.queue.len -| 1);
         } else if (vis_on) {
@@ -1289,6 +1583,34 @@ fn handleMouse(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, sta
 
     if (!m.press) return mouseRelease(gpa, arena, io, state, col, row);
     state.drag_from = null;
+
+    if (base == 0 and state.hint.len > 0 and row == state.hint_row) {
+        injected = hintKeyAt(state.hint, col);
+        return true;
+    }
+    if (base == 0 and state.np_bar_cols > 0) {
+        if (row == state.np_top and col >= 2 and col < 2 + state.np_label_cols) {
+            injected = .{ .ctrl = 0x10 };
+            return true;
+        }
+        if (row == state.np_top + 1 or (state.np_arc_row != null and row == state.np_arc_row.?)) {
+            injected = .{ .ctrl = 0x16 };
+            return true;
+        }
+        if (state.np_next_row != null and row == state.np_next_row.?) {
+            injected = .{ .ctrl = 0x0e };
+            return true;
+        }
+        if (row == state.np_top + 2 and col >= state.np_vol_x and col < state.np_vol_x + 10) {
+            if (state.pl) |p| {
+                if (p.isMuted()) _ = p.toggleMute();
+                p.setVolume(@floatFromInt((col - state.np_vol_x + 1) * 10));
+                state.volume = p.volume();
+                persistVolume(arena, state);
+            }
+            return true;
+        }
+    }
 
     if (state.now_track != null and state.np_bar_cols > 0 and row == state.np_top + 2 and col >= 2 and col < 2 + state.np_bar_cols) {
         if (base == 0) if (state.pl) |p| p.seekPercent(@as(f64, @floatFromInt(col - 2)) * 100.0 / @as(f64, @floatFromInt(state.np_bar_cols)));
@@ -1308,7 +1630,7 @@ fn handleMouse(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, sta
         for (state.mode_hits[0..state.mode_hit_len]) |hit| {
             if (col >= hit.x and col < hit.x + hit.w) switch (hit.target) {
                 .scope => |sc| setScope(arena, state, sc),
-                .filter => |f| setFilter(state, f),
+                .filter => |f| setFilter(arena, state, f),
             };
         }
         return true;
@@ -1389,8 +1711,10 @@ fn typingRowCount(state: *State) usize {
 
 fn cycleVis(arena: std.mem.Allocator, state: *State, dir: i2) void {
     const n = vis.count(state.flipbooks);
-    state.vis_idx = if (dir > 0) (state.vis_idx + 1) % n else (state.vis_idx + n - 1) % n;
+    const from = shownVis(state, coverArt(state));
+    state.vis_idx = if (dir > 0) (from + 1) % n else (state.vis_idx + n - 1) % n;
     saveSetting(arena, state, .visualizer, vis.name(state.vis_idx, state.flipbooks));
+    state.vis_label_at = state.tick;
 }
 
 fn loadFlipbooks(arena: std.mem.Allocator, io: std.Io, config_path: []const u8) []const vis.Flipbook {
@@ -1431,7 +1755,7 @@ fn ensurePlayer(gpa: std.mem.Allocator, state: *State) !*player.Player {
     if (state.pl) |p| return p;
     const p = try gpa.create(player.Player);
     errdefer gpa.destroy(p);
-    p.* = try player.Player.init();
+    p.* = try player.Player.init(state.pl_opts);
     p.setVolume(state.volume);
     state.pl = p;
     return p;
@@ -1443,10 +1767,12 @@ fn activateSelected(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io
     if (t.isPlayable()) {
         _ = state.play_arena.reset(.retain_capacity);
         const pa = state.play_arena.allocator();
-        var q = try pa.alloc(api.Track, state.tracks.len);
-        for (state.tracks, 0..) |src, i| q[i] = try cloneTrack(pa, src);
-        state.queue = q;
-        state.queue_idx = state.sel_track;
+        var q: std.ArrayList(api.Track) = .empty;
+        for (state.tracks, 0..) |src, i| if (src.isPlayable()) {
+            if (i == state.sel_track) state.queue_idx = q.items.len;
+            try q.append(pa, try cloneTrack(pa, src));
+        };
+        state.queue = q.items;
         try playQueueCurrent(gpa, arena, io, state);
         return;
     }
@@ -1465,21 +1791,8 @@ fn activateSelected(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io
             return showTracks(state);
         }
     }
-    if (t.browse_id.len > 0) {
-        state.status = "loading album…";
-        try draw(gpa, state);
-        const sa = state.search_arena.allocator();
-        const tracks = api.browseAlbum(sa, gpa, io, t.browse_id) catch |err| {
-            log.write("album load failed: {s} browse_id={s} title=\"{s}\"", .{ @errorName(err), t.browse_id, t.title });
-            state.status = "album load failed (see log)";
-            return;
-        };
-        state.tracks = tracks;
-        state.sel_track = 0;
-        state.scroll_track = 0;
-        state.status = "album loaded · ⏎/l play · h back";
-        return;
-    }
+    if (t.browse_id.len > 0) return openBrowse(gpa, io, state, t);
+    if (isMoreRow(t)) return loadMore(gpa, io, state);
     state.status = "no playable target";
 }
 
@@ -1495,7 +1808,7 @@ const ScanCtx = struct {
         self.state.scan_count = scanned;
         setStatus(self.state, "scanning… {d} files · any key to stop", .{scanned});
         draw(self.gpa, self.state) catch {};
-        const pressed = waitInput(0) catch false;
+        const pressed = term.waitInput(0) catch false;
         if (!pressed) return true;
         var buf: [8]u8 = undefined;
         _ = readKey(&buf) catch {};
@@ -1591,8 +1904,7 @@ fn enterLibraryRows(state: *State, rows: []api.Track) void {
 }
 
 fn showArtists(state: *State) !void {
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
 
     const names = try library.artistsOf(sa, state.lib_entries);
     var rows = try sa.alloc(api.Track, names.len);
@@ -1615,8 +1927,7 @@ fn showArtists(state: *State) !void {
 
 fn showAlbums(state: *State) !void {
     const artist = state.lib_artist;
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
 
     const albums = try library.albumsOf(sa, state.lib_entries, artist);
     var rows = try sa.alloc(api.Track, albums.len);
@@ -1636,8 +1947,7 @@ fn showAlbums(state: *State) !void {
 fn showTracks(state: *State) !void {
     const artist = state.lib_artist;
     const album = state.lib_album;
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
 
     const found = try library.tracksOf(sa, state.lib_entries, artist, album);
     var rows = try sa.alloc(api.Track, found.len);
@@ -1678,8 +1988,7 @@ fn openFeeds(gpa: std.mem.Allocator, io: std.Io, state: *State) !void {
         state.status = "no data dir for feeds";
         return;
     }
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
 
     const subs = feed.loadSubs(sa, state.feeds_path);
     if (subs.len == 0) {
@@ -1717,8 +2026,7 @@ fn openFeedEpisodes(gpa: std.mem.Allocator, io: std.Io, state: *State, url: []co
     };
     defer gpa.free(body);
 
-    _ = state.search_arena.reset(.retain_capacity);
-    const sa = state.search_arena.allocator();
+    const sa = resetSearch(state);
     const kept_title = sa.dupe(u8, title) catch title;
 
     const parsed = feed.parse(sa, body) orelse {
@@ -1947,15 +2255,17 @@ fn playQueueCurrent(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io
     }
 
     const p = try ensurePlayer(gpa, state);
+    const ready: ?[]u8 = if (state.next) |n| if (n.matches(t)) if (n.result()) |u| try gpa.dupe(u8, u) else null else null else null;
+    dropNext(state);
     p.stop();
     state.now_track = t;
-    state.connecting = t.source == .youtube;
+    state.connecting = t.source == .youtube and ready == null;
     if (state.connecting) {
         state.status = "connecting to YouTube…";
         try draw(gpa, state);
     }
 
-    const url = stream.resolve(gpa, io, t) catch |err| {
+    const url = ready orelse stream.resolve(gpa, io, t) catch |err| {
         log.write("stream resolve failed: {s} source={s} target={s} title=\"{s}\"", .{
             @errorName(err),
             track_mod.sourceName(t.source),
@@ -1980,6 +2290,119 @@ fn playQueueCurrent(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io
     try p.loadUrl(arena, url, try t.mediaTitle(arena));
     state.connecting = false;
     state.status = "playing";
+}
+
+fn replaygainMode(v: []const u8) [:0]const u8 {
+    if (std.mem.eql(u8, v, "track")) return "track";
+    if (std.mem.eql(u8, v, "album")) return "album";
+    return "no";
+}
+
+const PRELOAD_LEAD_S = 30;
+
+fn nextIndex(state: *const State) ?usize {
+    if (state.queue_idx >= state.queue.len) return null;
+    if (state.repeat == .track) return state.queue_idx;
+    var i = state.queue_idx + 1;
+    while (i < state.queue.len) : (i += 1) if (state.queue[i].isPlayable()) return i;
+    if (state.repeat != .queue) return null;
+    i = 0;
+    while (i <= state.queue_idx) : (i += 1) if (state.queue[i].isPlayable()) return i;
+    return null;
+}
+
+fn dropNext(state: *State) void {
+    const n = state.next orelse return;
+    if (state.next_queued) if (state.pl) |p| p.dropUpcoming();
+    n.release();
+    state.next = null;
+    state.next_queued = false;
+}
+
+fn syncNext(gpa: std.mem.Allocator, io: std.Io, state: *State) void {
+    if (!state.pl_opts.gapless) return;
+    const p = state.pl orelse return;
+    if (!p.has_track or state.now_track == null or state.connecting) return dropNext(state);
+    const ni = nextIndex(state) orelse return dropNext(state);
+    const want = state.queue[ni];
+    if (state.next) |n| {
+        if (!n.matches(want)) return dropNext(state);
+        if (state.next_queued or !n.ready()) return;
+        p.appendUrl(gpa, n.result() orelse return) catch return;
+        state.next_queued = true;
+        return;
+    }
+    const dur = p.duration() orelse return;
+    const pos = p.timePos() orelse return;
+    if (dur - pos > PRELOAD_LEAD_S) return;
+    state.next = stream.Prefetch.start(gpa, io, want) catch null;
+}
+
+const RADIO_MAX = 25;
+
+fn autoRadio(gpa: std.mem.Allocator, io: std.Io, state: *State) void {
+    if (!state.autoplay or state.repeat != .off or state.connecting) return;
+    const t = state.now_track orelse return;
+    if (t.source != .youtube or t.video_id.len == 0 or t.video_id.len > state.radio_seed.len) return;
+    if (nextIndex(state) != null) return;
+    if (std.mem.eql(u8, state.radio_seed[0..state.radio_seed_len], t.video_id)) return;
+    const n = extendRadio(gpa, io, state, t) catch |err| {
+        log.write("radio failed: {s} seed={s}", .{ @errorName(err), t.video_id });
+        return;
+    };
+    if (n > 0) setStatus(state, "autoplay · +{d} like {s}", .{ n, t.title });
+}
+
+fn extendRadio(gpa: std.mem.Allocator, io: std.Io, state: *State, seed: api.Track) !usize {
+    @memcpy(state.radio_seed[0..seed.video_id.len], seed.video_id);
+    state.radio_seed_len = seed.video_id.len;
+    var tmp = std.heap.ArenaAllocator.init(gpa);
+    defer tmp.deinit();
+    const found = try api.radio(tmp.allocator(), gpa, io, seed.video_id, RADIO_MAX);
+    const pa = state.play_arena.allocator();
+    var grown: std.ArrayList(api.Track) = .empty;
+    try grown.appendSlice(pa, state.queue);
+    for (found) |t| if (!api.contains(grown.items, t)) try grown.append(pa, try cloneTrack(pa, t));
+    const added = grown.items.len - state.queue.len;
+    state.queue = grown.items;
+    return added;
+}
+
+fn startRadio(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, state: *State) !void {
+    if (state.tracks.len == 0) return;
+    const t = state.tracks[state.sel_track];
+    if (t.source != .youtube or t.video_id.len == 0) {
+        state.status = "radio needs a YouTube song";
+        return;
+    }
+    _ = state.play_arena.reset(.retain_capacity);
+    const pa = state.play_arena.allocator();
+    const q = try pa.alloc(api.Track, 1);
+    q[0] = try cloneTrack(pa, t);
+    state.queue = q;
+    state.queue_idx = 0;
+    try playQueueCurrent(gpa, arena, io, state);
+    if (state.now_track == null) return;
+    const n = extendRadio(gpa, io, state, q[0]) catch |err| {
+        log.write("radio failed: {s} seed={s}", .{ @errorName(err), t.video_id });
+        state.status = "radio failed (see log)";
+        return;
+    };
+    setStatus(state, "radio · {d} like {s}", .{ n, q[0].title });
+}
+
+fn tookNext(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, state: *State) !void {
+    const n = state.next.?;
+    const ni = nextIndex(state);
+    const same = if (ni) |i| n.matches(state.queue[i]) else false;
+    state.next_queued = false;
+    dropNext(state);
+    if (!same) return queueAdvance(gpa, arena, io, state, true);
+    const t = state.queue[ni.?];
+    state.queue_idx = ni.?;
+    state.now_track = t;
+    state.status = "playing";
+    if (state.pl) |p| try p.setTitle(arena, try t.mediaTitle(arena));
 }
 
 fn queueAdvance(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, state: *State, auto: bool) !void {
@@ -2019,12 +2442,17 @@ fn handlePlayerEvent(
     ev: player.Event,
 ) !void {
     switch (ev) {
-        .end_file => try queueAdvance(gpa, arena, io, state, true),
+        .end_file => if (state.next_queued) try tookNext(gpa, arena, io, state) else try queueAdvance(gpa, arena, io, state, true),
         .file_error => {
             const why = if (state.pl) |p| p.last_error else "";
-            const title = if (state.now_track) |t| t.title else "";
-            log.write("playback failed: {s} title=\"{s}\"", .{ why, title });
-            const was_youtube = if (state.now_track) |t| t.source == .youtube else false;
+            const t: track_mod.Track = state.now_track orelse .{ .title = "", .artist = "" };
+            log.write("playback failed: {s} source={s} target={s} title=\"{s}\"", .{
+                why,
+                track_mod.sourceName(t.source),
+                if (t.source == .youtube) t.video_id else t.uri,
+                t.title,
+            });
+            const was_youtube = state.now_track != null and t.source == .youtube;
             state.now_track = null;
             state.connecting = false;
             if (was_youtube) if (staleYtdlp(gpa, io, state)) |days| {
@@ -2033,7 +2461,7 @@ fn handlePlayerEvent(
             };
             setStatus(state, "playback failed: {s} (see log)", .{why});
         },
-        .audio_ready => installInterruptHandlers(),
+        .audio_ready => term.exitOnInterrupt(RESTORE_SEQ),
         .shutdown => state.now_track = null,
         else => {},
     }
@@ -2131,23 +2559,15 @@ fn tailCols(s: []const u8, max_cols: usize) []const u8 {
     return s[i..];
 }
 
-fn termSize() struct { cols: usize, rows: usize } {
-    var ws: posix.winsize = undefined;
-    const req: c_int = @bitCast(@as(c_uint, @intCast(std.c.T.IOCGWINSZ)));
-    if (std.c.ioctl(STDOUT, req, &ws) == 0 and ws.col > 0) {
-        return .{
-            .cols = @intCast(ws.col),
-            .rows = if (ws.row > 0) @intCast(ws.row) else 24,
-        };
-    }
-    return .{ .cols = 80, .rows = 24 };
-}
-
 fn draw(gpa: std.mem.Allocator, state: *State) !void {
-    const sz = termSize();
+    const sz = term.size();
     state.np_bar_cols = 0;
+    state.np_arc_row = null;
+    state.np_next_row = null;
+    state.hint = "";
     if (state.vis_view and state.now_track == null) state.vis_view = false;
     if (state.vis_view) return drawVisView(gpa, state, sz.cols, sz.rows);
+    if (state.lyrics_view and state.now_track != null) return drawLyricsView(gpa, state, sz.cols, sz.rows);
     const need: usize = sz.cols * sz.rows * 32 + 4096;
     if (state.draw_buf.capacity < need) {
         try state.draw_buf.ensureTotalCapacity(gpa, need);
@@ -2206,6 +2626,8 @@ fn draw(gpa: std.mem.Allocator, state: *State) !void {
                 "podcasts")
         else if (state.in_library)
             libraryCrumb(state, &crumb_buf)
+        else if (state.yt_crumb.len > 0)
+            state.yt_crumb
         else
             "results",
         .picker => "add to playlist",
@@ -2222,10 +2644,11 @@ fn draw(gpa: std.mem.Allocator, state: *State) !void {
         std.fmt.bufPrint(&sec_buf, "{s} ⟨^T {s}⟩", .{ section, state.filter.label() }) catch section
     else
         section;
+    const sec_shown = tailCols(sec_label, inner -| 4);
 
-    try w.print("{s}├─ {s}{s}{s} ", .{ th.accent, th.bold, sec_label, th.reset });
+    try w.print("{s}├─ {s}{s}{s} ", .{ th.accent, th.bold, sec_shown, th.reset });
     try w.writeAll(th.accent);
-    try w.splatBytesAll("─", (inner + 1) -| (3 + visibleCols(sec_label) + 1));
+    try w.splatBytesAll("─", (inner + 1) -| (3 + visibleCols(sec_shown) + 1));
     try w.print("┤{s}\r\n", .{th.reset});
 
     state.body_top = if (show_mode) 5 else 4;
@@ -2244,7 +2667,7 @@ fn draw(gpa: std.mem.Allocator, state: *State) !void {
     try boxBottom(&w, th, inner);
 
     if (state.now_track != null and footer_rows > 0) {
-        try drawNowPlaying(&w, th, inner, state, footer_rows, true);
+        try drawNowPlaying(gpa, &w, th, inner, state, footer_rows, true);
     }
 
     const tight = width < 76;
@@ -2261,15 +2684,14 @@ fn draw(gpa: std.mem.Allocator, state: *State) !void {
         .results => if (state.view_pl != null)
             "jk/↑↓ · ⏎/l play · P add · d/^X remove · h back · [/] seek · -/= vol · m mute · ^R repeat · ␣/^P pause"
         else
-            "jk/↑↓ · ⏎/l play · a/A queue · ^Q queue view · P save · h back · [/] seek · -/= vol · ^V visualizer · ␣ pause",
+            "jk/↑↓ · ⏎/l play · a/A queue · R radio · ^Q queue view · P save · h back · [/] seek · -/= vol · ^V visualizer · ␣ pause",
         .picker => "↑↓ pick · type to name a new playlist · ⏎ add · esc cancel",
         .queue => "jk/↑↓ · KJ move · d remove · s shuffle · ⏎ play · h back · ␣ pause · -/= vol · ^V visualizer",
     };
-    const hint_fit = truncateCols(hint, width -| 1);
-    try w.print("{s} {s}{s}\x1b[K", .{ th.dim, hint_fit, th.reset });
+    try drawHint(&w, th, state, hint, width, sz.rows);
     try w.writeAll("\x1b[J\x1b[?2026l");
 
-    try writeAll(w.buffered());
+    try term.writeAll(w.buffered());
 }
 
 fn drawVisView(gpa: std.mem.Allocator, state: *State, width: usize, height: usize) !void {
@@ -2286,7 +2708,7 @@ fn drawVisView(gpa: std.mem.Allocator, state: *State, width: usize, height: usiz
         const top = height / 2 -| 1;
         try w.print("\x1b[{d};1H{s}{s}{s}", .{ top + 1, th.dim, truncateCols(msg, width), th.reset });
         try w.writeAll("\x1b[?2026l");
-        return writeAll(w.buffered());
+        return term.writeAll(w.buffered());
     }
 
     const inner = width - 2;
@@ -2296,16 +2718,26 @@ fn drawVisView(gpa: std.mem.Allocator, state: *State, width: usize, height: usiz
     const vis_w = width - 4 - (if (panel > 0) panel + 1 else 0);
     const vis_h = main_h - 2;
 
-    var lbl_buf: [96]u8 = undefined;
-    const n = vis.count(state.flipbooks);
-    const label = std.fmt.bufPrint(&lbl_buf, " ♫ hum · {s} {d}/{d} ", .{ vis.name(state.vis_idx, state.flipbooks), state.vis_idx + 1, n }) catch " ♫ hum ";
+    const art = coverArt(state);
+    const shown = shownVis(state, art);
+    var lbl_buf: [128]u8 = undefined;
+    const age = if (state.vis_label_at) |at| state.tick -% at else VIS_LABEL_TICKS;
+    if (age >= VIS_LABEL_TICKS) state.vis_label_at = null;
+    const fade = if (age < VIS_LABEL_TICKS * 3 / 5) "" else if (age < VIS_LABEL_TICKS * 4 / 5) th.accent else th.dim;
+    const label = if (age >= VIS_LABEL_TICKS) " ♫ hum " else std.fmt.bufPrint(&lbl_buf, " ♫ hum {s}{s}· {s} {d}/{d} ", .{
+        if (fade.len > 0) th.reset else "",
+        fade,
+        vis.name(shown, state.flipbooks),
+        shown + 1,
+        vis.count(state.flipbooks),
+    }) catch " ♫ hum ";
     try boxTop(&w, th, inner, label);
 
     state.mode_row = null;
     state.vis_rect = .{ .x = 2, .y = 1, .w = vis_w, .h = vis_h };
     state.panel_rect = if (panel > 0) .{ .x = vis_w + 4, .y = 1, .w = panel, .h = vis_h } else .{};
     var cv = try state.vis_bufs.canvas(gpa, vis_w, vis_h);
-    vis.render(&cv, state.vis_idx, state.flipbooks, &state.vis_motion, visAudio(state), state.tick);
+    vis.render(&cv, shown, state.flipbooks, &state.vis_motion, visAudio(state), state.tick, art orelse .{});
 
     for (0..vis_h) |y| {
         try w.print("{s}│{s} ", .{ th.accent, th.reset });
@@ -2321,31 +2753,95 @@ fn drawVisView(gpa: std.mem.Allocator, state: *State, width: usize, height: usiz
     try boxBottom(&w, th, inner);
 
     state.np_top = main_h;
-    try drawNowPlaying(&w, th, inner, state, np_rows, false);
+    try drawNowPlaying(gpa, &w, th, inner, state, np_rows, false);
 
     const hint = if (width < 76)
         "v/V visualizer · ^V back · ␣ pause · -/= vol"
     else
         "v next · V prev · ^V/esc back · ␣ pause · -/= vol · [/] seek · m mute · ^Y theme";
-    try w.print("{s} {s}{s}\x1b[K", .{ th.dim, truncateCols(hint, width -| 1), th.reset });
+    try drawHint(&w, th, state, hint, width, height);
     try w.writeAll("\x1b[J\x1b[?2026l");
-    try writeAll(w.buffered());
+    try term.writeAll(w.buffered());
+}
+
+fn drawHint(w: *std.Io.Writer, th: theme_mod.Theme, state: *State, hint: []const u8, width: usize, height: usize) !void {
+    state.hint = truncateCols(hint, width -| 1);
+    state.hint_row = height -| 1;
+    try w.print("{s} {s}{s}\x1b[K", .{ th.dim, state.hint, th.reset });
+}
+
+fn hintKeyAt(hint: []const u8, col: usize) ?Key {
+    var at: usize = 1;
+    var segs = std.mem.splitSequence(u8, hint, " · ");
+    while (segs.next()) |seg| {
+        const seg_cols = visibleCols(seg);
+        defer at += seg_cols + 3;
+        if (col < at or col >= at + seg_cols) continue;
+        const tok = seg[0 .. std.mem.indexOfScalar(u8, seg, ' ') orelse seg.len];
+        var first: ?Key = null;
+        var x = at;
+        var i: usize = 0;
+        while (i < tok.len) {
+            const word: usize = if (tok[i] == '^' and i + 1 < tok.len) 2 else if (std.mem.startsWith(u8, tok[i..], "esc") or std.mem.startsWith(u8, tok[i..], "tab")) 3 else std.unicode.utf8ByteSequenceLength(tok[i]) catch 1;
+            const unit = tok[i..@min(tok.len, i + word)];
+            i += unit.len;
+            const unit_cols = visibleCols(unit);
+            defer x += unit_cols;
+            if (std.mem.eql(u8, unit, "/")) continue;
+            const k = unitKey(unit);
+            if (first == null) first = k;
+            if (col >= x and col < x + unit_cols) return k;
+        }
+        return first;
+    }
+    return null;
+}
+
+fn unitKey(u: []const u8) Key {
+    if (u.len == 2 and u[0] == '^') return if (u[1] == 'C') .ctrl_c else .{ .ctrl = u[1] & 0x1f };
+    const named = [_]struct { []const u8, Key }{
+        .{ "esc", .escape }, .{ "tab", .tab },
+        .{ "⏎", .enter },
+        .{ "␣", .{ .text = " " } },
+        .{ "↑", .up },
+        .{ "↓", .down },
+        .{ "←", .left },
+        .{ "→", .right },
+    };
+    for (named) |n| if (std.mem.eql(u8, u, n[0])) return n[1];
+    return .{ .text = u };
+}
+
+fn syncArt(gpa: std.mem.Allocator, io: std.Io, state: *State) void {
+    if (!state.vis_view or state.vis_idx != vis.COVER) return;
+    const t = state.now_track orelse return;
+    if (state.art_job) |j| {
+        if (j.matches(t)) return;
+        j.release();
+        state.art_job = null;
+    }
+    state.art_job = art_mod.Job.start(gpa, io, t) catch null;
+}
+
+fn coverArt(state: *const State) ?vis.Art {
+    const t = state.now_track orelse return null;
+    const j = state.art_job orelse return .{ .note = "loading cover…" };
+    if (!j.matches(t) or !j.ready()) return .{ .note = "loading cover…" };
+    if (j.result()) |px| return .{ .px = px, .side = art_mod.SIZE };
+    return null;
+}
+
+fn shownVis(state: *const State, art: ?vis.Art) usize {
+    return if (state.vis_idx == vis.COVER and art == null) vis.COVER + 1 else state.vis_idx;
 }
 
 fn visAudio(state: *State) vis.Audio {
-    if (state.vis_audio_tick == state.tick) return state.vis_audio;
+    if (state.vis_audio_tick == state.tick) return state.vis_meter.audio;
     state.vis_audio_tick = state.tick;
     const pl = state.pl orelse return .{};
     const idle = state.connecting or pl.isPaused() or pl.isMuted();
-    const raw = if (idle) player.Player.Levels{ .level = 0, .left = 0, .right = 0, .bright = 0 } else pl.levels();
-    const a = &state.vis_audio;
-    a.paused = idle;
-    inline for (.{ "level", "left", "right", "bright" }) |f| {
-        const cur = @field(a, f);
-        const tgt = @field(raw, f);
-        @field(a, f) = cur + (tgt - cur) * (if (tgt > cur) @as(f32, 0.6) else 0.18);
-    }
-    return a.*;
+    const r: player.Player.Levels = if (idle) .{} else pl.levels();
+    return state.vis_meter.update(idle, r.level, r.left, r.right, r.bright, r.bands);
 }
 
 fn emitCanvasRow(w: *std.Io.Writer, th: theme_mod.Theme, cv: *const vis.Canvas, y: usize) !void {
@@ -2678,7 +3174,7 @@ fn drawResults(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, rows: usize
 
         const head_cols: usize = 2;
         const remaining = room -| head_cols;
-        const sep = "  — ";
+        const sep: []const u8 = if (t.artist.len > 0) "  — " else "";
         const sep_cols = visibleCols(sep);
 
         var kind_buf: [16]u8 = undefined;
@@ -2723,7 +3219,7 @@ fn drawResults(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, rows: usize
 const TitleArtist = struct { title: []const u8, artist: []const u8, cols: usize };
 
 fn fitTitleArtist(title: []const u8, artist: []const u8, room: usize, sep_cols: usize) TitleArtist {
-    const budget = if (room > sep_cols + 4) (room * 2) / 3 else room;
+    const budget = if (artist.len > 0 and room > sep_cols + 4) (room * 2) / 3 else room;
     const t = truncateCols(title, budget);
     const t_cols = visibleCols(t);
     const a = truncateCols(artist, room -| t_cols -| sep_cols);
@@ -2737,13 +3233,14 @@ fn kindShort(k: []const u8) []const u8 {
     if (std.mem.eql(u8, k, "Artist")) return "artist";
     if (std.mem.eql(u8, k, "Episode")) return "ep";
     if (std.mem.eql(u8, k, "Playlist")) return "list";
+    if (std.mem.eql(u8, k, "Single")) return "single";
+    if (std.mem.eql(u8, k, "More")) return "more";
+    if (std.mem.eql(u8, k, "Profile")) return "profile";
     if (std.mem.eql(u8, k, "Feed")) return "feed";
     return k;
 }
 
-const BAR_CHARS = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
-
-fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *State, rows: usize, with_bars: bool) !void {
+fn drawNowPlaying(gpa: std.mem.Allocator, w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *State, rows: usize, with_bars: bool) !void {
     const t = state.now_track.?;
     const pl = state.pl orelse return;
     const connecting = state.connecting;
@@ -2757,6 +3254,7 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
     };
     var lbl_buf: [64]u8 = undefined;
     const label = std.fmt.bufPrint(&lbl_buf, " {s}{s} ", .{ state_txt, rep }) catch " ▶ ";
+    state.np_label_cols = visibleCols(label);
     try boxTop(w, th, inner, label);
 
     {
@@ -2797,6 +3295,8 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
 
         const bar_room = room -| time_cols;
         state.np_bar_cols = bar_room;
+        const vol_at = std.mem.indexOf(u8, time_str, "vol ") orelse 0;
+        state.np_vol_x = 2 + bar_room + visibleCols(time_str[0 .. vol_at + 4]);
         const filled: usize = @intFromFloat(@as(f64, @floatFromInt(bar_room)) * frac);
         var k: usize = 0;
         try w.writeAll(th.accent_strong);
@@ -2812,15 +3312,16 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
     const show_next = if (with_bars) rows >= 6 else rows >= 5;
 
     if (show_bars) {
+        state.np_arc_row = state.np_top + 3;
         try w.print("{s}│{s} ", .{ th.accent, th.reset });
-        const room = inner -| 1;
-        const idle = paused or connecting or pl.isMuted();
-        const rms = if (idle) 0 else pl.rmsLevel();
-        try drawBars(w, th, room, state.tick, idle, rms);
+        var cv = try state.vis_bufs.canvas(gpa, inner -| 1, 1);
+        vis.strip(&cv, &state.vis_motion, visAudio(state), state.tick);
+        try emitCanvasRow(w, th, &cv, 0);
         try w.print("{s}│{s}\r\n", .{ th.accent, th.reset });
     }
 
     if (show_next) {
+        state.np_next_row = state.np_top + @as(usize, if (show_bars) 4 else 3);
         try w.print("{s}│{s} ", .{ th.accent, th.reset });
         const room = inner -| 1;
         const prefix = "next ▸ ";
@@ -2829,8 +3330,8 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
 
         var used_n = prefix_cols;
         const text_room = room -| used_n;
-        if (state.queue.len > 0 and state.queue_idx + 1 < state.queue.len) {
-            const nt = state.queue[state.queue_idx + 1];
+        if (nextIndex(state)) |ni| {
+            const nt = state.queue[ni];
             const sep = " — ";
             const fit = fitTitleArtist(nt.title, nt.artist, text_room, visibleCols(sep));
             try w.writeAll(fit.title);
@@ -2849,32 +3350,6 @@ fn drawNowPlaying(w: *std.Io.Writer, th: theme_mod.Theme, inner: usize, state: *
     try boxBottom(w, th, inner);
 }
 
-fn drawBars(w: *std.Io.Writer, th: theme_mod.Theme, room: usize, tick: u64, paused: bool, rms: f64) !void {
-    const bars = @min(room, VIS_BARS);
-    const tf: f64 = @floatFromInt(tick);
-
-    var env = std.math.clamp(rms * 2.6, 0, 1);
-    if (paused) env = 0;
-    if (!paused and env < 0.08) env = 0.08;
-
-    var i: usize = 0;
-    while (i < bars) : (i += 1) {
-        const fi: f64 = @floatFromInt(i);
-        const m1 = @sin(tf * 0.22 + fi * 0.42);
-        const m2 = @sin(tf * 0.11 + fi * 0.19 + 1.9);
-        const mod = (m1 + m2) * 0.25 + 0.75;
-        const height = std.math.clamp(env * mod, 0, 1);
-        const lvl_f = height * 8.0;
-        const lvl: usize = @intFromFloat(@max(0, @min(7, lvl_f)));
-
-        const color = if (lvl >= 7) th.accent_strong else if (lvl >= 4) th.accent else th.dim;
-        try w.writeAll(color);
-        try w.writeAll(BAR_CHARS[lvl]);
-    }
-    try w.writeAll(th.reset);
-    try w.splatByteAll(' ', room -| bars);
-}
-
 fn fmtTime(buf: []u8, secs: f64) []const u8 {
     const total: u32 = @intFromFloat(@max(0, secs));
     const h = total / 3600;
@@ -2882,52 +3357,6 @@ fn fmtTime(buf: []u8, secs: f64) []const u8 {
     const s = total % 60;
     if (h > 0) return std.fmt.bufPrint(buf, "{d}:{d:0>2}:{d:0>2}", .{ h, m, s }) catch "0:00:00";
     return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ m, s }) catch "00:00";
-}
-
-var saved_termios: ?posix.termios = null;
-
-fn onInterrupt(_: posix.SIG) callconv(.c) void {
-    const restore = MOUSE_OFF ++ PASTE_OFF ++ "\x1b[?25h\x1b[?1049l";
-    _ = c.write(STDOUT, restore, restore.len);
-    if (saved_termios) |t| posix.tcsetattr(STDIN, .NOW, t) catch {};
-    c._exit(130);
-}
-
-fn installInterruptHandlers() void {
-    const act = posix.Sigaction{
-        .handler = .{ .handler = onInterrupt },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &act, null);
-    posix.sigaction(posix.SIG.TERM, &act, null);
-}
-
-fn enterRaw() !posix.termios {
-    const orig = try posix.tcgetattr(STDIN);
-    var raw = orig;
-    raw.lflag.ICANON = false;
-    raw.lflag.ECHO = false;
-    raw.lflag.IEXTEN = false;
-    raw.iflag.IXON = false;
-    raw.iflag.ICRNL = false;
-    raw.cc[@backingInt(posix.V.MIN)] = 1;
-    raw.cc[@backingInt(posix.V.TIME)] = 0;
-    try posix.tcsetattr(STDIN, .NOW, raw);
-    return orig;
-}
-
-fn restoreTty(orig: posix.termios) void {
-    posix.tcsetattr(STDIN, .NOW, orig) catch {};
-}
-
-fn writeAll(bytes: []const u8) !void {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const n = c.write(STDOUT, bytes[i..].ptr, bytes.len - i);
-        if (n <= 0) return error.WriteFailed;
-        i += @intCast(n);
-    }
 }
 
 const testing = std.testing;
@@ -3085,4 +3514,45 @@ test "kindShort maps known kinds and passes through unknown" {
     try testing.expectEqualStrings("song", kindShort("Song"));
     try testing.expectEqualStrings("ep", kindShort("Episode"));
     try testing.expectEqualStrings("Mixtape", kindShort("Mixtape"));
+}
+
+test "gapless preloads the track queueAdvance would pick" {
+    var q = [_]api.Track{
+        .{ .video_id = "a", .title = "", .artist = "" },
+        .{ .title = "header", .artist = "" },
+        .{ .video_id = "c", .title = "", .artist = "" },
+    };
+    var state: State = .{ .queue = &q, .queue_idx = 0 };
+    try testing.expectEqual(@as(?usize, 2), nextIndex(&state));
+    state.queue_idx = 2;
+    try testing.expectEqual(@as(?usize, null), nextIndex(&state));
+    state.repeat = .queue;
+    try testing.expectEqual(@as(?usize, 0), nextIndex(&state));
+    state.repeat = .track;
+    try testing.expectEqual(@as(?usize, 2), nextIndex(&state));
+    state.queue = &.{};
+    try testing.expectEqual(@as(?usize, null), nextIndex(&state));
+}
+
+test "replaygain config maps onto mpv values" {
+    try testing.expectEqualStrings("track", replaygainMode("track"));
+    try testing.expectEqualStrings("album", replaygainMode("album"));
+    try testing.expectEqualStrings("no", replaygainMode("off"));
+    try testing.expectEqualStrings("no", replaygainMode("loud"));
+}
+
+test "clicking a hint presses the key under the cursor" {
+    const hint = "v next · V prev · ^V/esc back · ␣ pause · -/= vol";
+    try testing.expectEqualStrings("v", hintKeyAt(hint, 1).?.text);
+    try testing.expectEqualStrings("v", hintKeyAt(hint, 5).?.text);
+    try testing.expectEqualStrings("V", hintKeyAt(hint, 10).?.text);
+    try testing.expectEqual(@as(u8, 0x16), hintKeyAt(hint, 20).?.ctrl);
+    try testing.expect(hintKeyAt(hint, 22).? == .escape);
+    try testing.expectEqual(@as(u8, 0x16), hintKeyAt(hint, 26).?.ctrl);
+    try testing.expectEqualStrings(" ", hintKeyAt(hint, 33).?.text);
+    try testing.expectEqualStrings("-", hintKeyAt(hint, 43).?.text);
+    try testing.expectEqualStrings("=", hintKeyAt(hint, 45).?.text);
+    try testing.expect(hintKeyAt(hint, 8) == null);
+    try testing.expect(hintKeyAt(hint, 200) == null);
+    try testing.expect(hintKeyAt("⏎ search · ^C quit", 12).? == .ctrl_c);
 }

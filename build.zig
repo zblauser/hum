@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "hum",
         .root_module = mod,
+        .win32_manifest = b.path("src/hum.manifest"),
     });
 
     b.installArtifact(exe);
@@ -62,6 +63,7 @@ fn addCheckStep(b: *std.Build, options: *std.Build.Step.Options) void {
         "aarch64-linux-gnu",
         "x86_64-macos",
         "aarch64-macos",
+        "x86_64-windows-gnu",
     };
     const modes = [_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe };
 

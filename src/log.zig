@@ -53,11 +53,12 @@ test "path honors XDG_DATA_HOME and falls back to HOME" {
 
     var xdg: std.process.Environ.Map = .init(a);
     try xdg.put("XDG_DATA_HOME", "/data");
-    try testing.expectEqualStrings("/data/hum/log", try path(a, &xdg));
+    const S = std.fs.path.sep_str;
+    try testing.expectEqualStrings("/data" ++ S ++ "hum" ++ S ++ "log", try path(a, &xdg));
 
     var home: std.process.Environ.Map = .init(a);
     try home.put("HOME", "/home/u");
-    try testing.expectEqualStrings("/home/u/.local/share/hum/log", try path(a, &home));
+    if (S[0] == '/') try testing.expectEqualStrings("/home/u/.local/share/hum/log", try path(a, &home));
 
     var empty: std.process.Environ.Map = .init(a);
     try testing.expectError(error.NoHome, path(a, &empty));

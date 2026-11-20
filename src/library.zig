@@ -14,6 +14,15 @@ pub const Entry = struct {
     duration_s: u32 = 0,
     mtime: i64 = 0,
     size: u64 = 0,
+    key: []const u8 = "",
+
+    pub fn keyed(e: Entry, arena: std.mem.Allocator) !Entry {
+        var fo: Folded = .{};
+        fo.of(.{ e.title, e.artist, e.album });
+        var k = e;
+        k.key = try std.mem.join(arena, "\x1f", &fo.f);
+        return k;
+    }
 };
 
 const EXTS = [_][]const u8{
@@ -43,12 +52,12 @@ pub fn cachePath(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]c
 
 pub fn roots(arena: std.mem.Allocator, env: *std.process.Environ.Map, configured: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, configured, ':');
+    var it = std.mem.splitScalar(u8, configured, std.fs.path.delimiter);
     while (it.next()) |raw| {
         const dir = std.mem.trim(u8, raw, " \t\r\n");
         if (dir.len == 0) continue;
-        if (std.mem.startsWith(u8, dir, "~/")) {
-            const home = env.get("HOME") orelse continue;
+        if (dir.len >= 2 and dir[0] == '~' and std.fs.path.isSep(dir[1])) {
+            const home = env.get("HOME") orelse env.get("USERPROFILE") orelse continue;
             try out.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ home, dir[2..] }));
         } else {
             try out.append(arena, try arena.dupe(u8, dir));
@@ -130,7 +139,7 @@ pub fn scan(
             if (meta.artist.len == 0) meta.artist = "unknown";
             if (meta.album.len == 0) meta.album = "unknown";
 
-            try out.append(arena, .{
+            try out.append(arena, try (Entry{
                 .path = full,
                 .title = meta.title,
                 .artist = meta.artist,
@@ -139,7 +148,7 @@ pub fn scan(
                 .duration_s = meta.duration_s,
                 .mtime = mtime,
                 .size = st.size,
-            });
+            }).keyed(arena));
         }
     }
     return .{ .entries = try out.toOwnedSlice(arena), .complete = true };
@@ -204,7 +213,7 @@ pub fn loadCache(arena: std.mem.Allocator, file_path: []const u8) Cached {
         const duration = f.next() orelse "0";
         if (path.len == 0) continue;
 
-        out.append(arena, .{
+        const e = (Entry{
             .path = path,
             .title = title,
             .artist = artist,
@@ -213,7 +222,8 @@ pub fn loadCache(arena: std.mem.Allocator, file_path: []const u8) Cached {
             .duration_s = std.fmt.parseInt(u32, duration, 10) catch 0,
             .mtime = std.fmt.parseInt(i64, mtime, 10) catch 0,
             .size = std.fmt.parseInt(u64, size, 10) catch 0,
-        }) catch return .{ .roots = from_roots, .entries = out.items };
+        }).keyed(arena) catch return .{ .roots = from_roots, .entries = out.items };
+        out.append(arena, e) catch return .{ .roots = from_roots, .entries = out.items };
     }
     return .{ .roots = from_roots, .entries = out.items };
 }
@@ -281,32 +291,139 @@ pub fn tracksOf(
     return out.items;
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return false;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+const MAX_TOKENS = 8;
+
+pub const Query = struct {
+    buf: [txt.FOLD_MAX]u8 = undefined,
+    whole: []const u8 = "",
+    tokens: [MAX_TOKENS][]const u8 = undefined,
+    len: usize = 0,
+
+    pub fn init(self: *Query, raw: []const u8) void {
+        self.whole = txt.fold(&self.buf, raw);
+        var it = std.mem.tokenizeScalar(u8, self.whole, ' ');
+        while (it.next()) |t| {
+            if (self.len == MAX_TOKENS) break;
+            self.tokens[self.len] = t;
+            self.len += 1;
+        }
     }
-    return false;
+
+    fn words(self: *const Query) []const []const u8 {
+        return self.tokens[0..self.len];
+    }
+};
+
+const Folded = struct {
+    bufs: [3][txt.FOLD_MAX]u8 = undefined,
+    f: [3][]const u8 = undefined,
+
+    fn of(self: *Folded, fields: [3][]const u8) void {
+        for (fields, 0..) |v, i| self.f[i] = txt.fold(&self.bufs[i], v);
+    }
+
+    fn entry(self: *Folded, e: Entry) []const []const u8 {
+        if (e.key.len == 0) {
+            self.of(.{ e.title, e.artist, e.album });
+            return &self.f;
+        }
+        var it = std.mem.splitScalar(u8, e.key, 0x1f);
+        for (&self.f) |*f| f.* = it.next() orelse "";
+        return &self.f;
+    }
+};
+
+const W_START = [3]u32{ 6, 4, 4 };
+const W_INSIDE: u32 = 2;
+const W_FUZZY: u32 = 1;
+
+fn tokenScore(fields: []const []const u8, tok: []const u8, fuzzy: bool) u32 {
+    var best: u32 = 0;
+    for (fields, 0..) |f, i| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, f, from, tok)) |at| : (from = at + 1) {
+            const start = at == 0 or f[at - 1] == ' ';
+            best = @max(best, if (start) W_START[i] else W_INSIDE);
+            if (start) break;
+        }
+    }
+    if (best > 0 or !fuzzy or tok.len < 4) return best;
+    const max_d: usize = if (tok.len >= 8) 2 else 1;
+    for (fields) |f| {
+        var it = std.mem.tokenizeScalar(u8, f, ' ');
+        while (it.next()) |w| if ((w[0] == tok[0] or w[w.len - 1] == tok[tok.len - 1]) and withinEdits(w, tok, max_d)) return W_FUZZY;
+    }
+    return 0;
+}
+
+fn withinEdits(a: []const u8, b: []const u8, max_d: usize) bool {
+    if (@max(a.len, b.len) - @min(a.len, b.len) > max_d or b.len > 32 or a.len > 32) return false;
+    var prev: [33]usize = undefined;
+    var cur: [33]usize = undefined;
+    for (0..b.len + 1) |j| prev[j] = j;
+    for (a, 1..) |ca, i| {
+        cur[0] = i;
+        var row_min = i;
+        for (b, 1..) |cb, j| {
+            const sub = prev[j - 1] + @intFromBool(ca != cb);
+            cur[j] = @min(sub, @min(prev[j], cur[j - 1]) + 1);
+            row_min = @min(row_min, cur[j]);
+        }
+        if (row_min > max_d) return false;
+        @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+    }
+    return prev[b.len] <= max_d;
+}
+
+pub fn queryScore(q: *const Query, fields: []const []const u8, fuzzy: bool) ?u32 {
+    if (q.len == 0) return null;
+    var total: u32 = 0;
+    for (q.words()) |tok| {
+        const s = tokenScore(fields, tok, fuzzy);
+        if (s == 0) return null;
+        total += s;
+    }
+    for (fields, 0..) |f, i| {
+        if (std.mem.eql(u8, f, q.whole)) total += if (i == 0) 40 else 25;
+        if (i == 0 and f.len > q.whole.len and std.mem.startsWith(u8, f, q.whole)) total += 15;
+    }
+    return total;
+}
+
+const Hit = struct { idx: u32, score: u32 };
+
+fn higherScore(_: void, a: Hit, b: Hit) bool {
+    return a.score > b.score or (a.score == b.score and a.idx < b.idx);
+}
+
+fn betterHit(entries: []const Entry, a: Hit, b: Hit) bool {
+    if (a.score != b.score) return a.score > b.score;
+    const x = entries[a.idx];
+    const y = entries[b.idx];
+    if (!std.ascii.eqlIgnoreCase(x.artist, y.artist)) return lessCaseless({}, x.artist, y.artist);
+    if (!std.ascii.eqlIgnoreCase(x.album, y.album)) return lessCaseless({}, x.album, y.album);
+    return beforeInAlbum({}, x, y);
 }
 
 pub fn search(arena: std.mem.Allocator, entries: []const Entry, query: []const u8, max: usize) ![]Entry {
-    var out: std.ArrayList(Entry) = .empty;
-    if (query.len == 0) return out.items;
+    var q: Query = .{};
+    q.init(query);
+    if (q.len == 0) return &.{};
 
-    for (entries) |e| {
-        if (out.items.len >= max) return out.items;
-        if (containsIgnoreCase(e.title, query)) try out.append(arena, e);
-    }
-    for (entries) |e| {
-        if (out.items.len >= max) return out.items;
-        if (containsIgnoreCase(e.title, query)) continue;
-        if (containsIgnoreCase(e.artist, query) or containsIgnoreCase(e.album, query)) {
-            try out.append(arena, e);
+    var hits: std.ArrayList(Hit) = .empty;
+    for ([_]bool{ false, true }) |fuzzy| {
+        var fo: Folded = .{};
+        for (entries, 0..) |e, i| {
+            if (queryScore(&q, fo.entry(e), fuzzy)) |sc| try hits.append(arena, .{ .idx = @intCast(i), .score = sc });
         }
+        if (hits.items.len > 0) break;
     }
-    return out.items;
+    const n = @min(hits.items.len, max);
+    if (hits.items.len > n) std.mem.sort(Hit, hits.items, {}, higherScore);
+    std.mem.sort(Hit, hits.items[0..n], entries, betterHit);
+    var out = try arena.alloc(Entry, n);
+    for (hits.items[0..n], 0..) |h, i| out[i] = entries[h.idx];
+    return out;
 }
 
 pub fn namesMatching(
@@ -338,11 +455,17 @@ pub fn albumsMatching(
     query: []const u8,
     max: usize,
 ) ![]AlbumRef {
+    var q: Query = .{};
+    q.init(query);
+    var fo: Folded = .{};
     var out: std.ArrayList(AlbumRef) = .empty;
     for (entries) |e| {
         if (out.items.len >= max) break;
         if (e.album.len == 0) continue;
-        if (query.len > 0 and !containsIgnoreCase(e.album, query) and !containsIgnoreCase(e.artist, query)) continue;
+        if (q.len > 0) {
+            fo.of(.{ e.album, e.artist, "" });
+            if (queryScore(&q, fo.f[0..2], false) == null) continue;
+        }
         var dupe = false;
         for (out.items) |have| {
             if (std.ascii.eqlIgnoreCase(have.album, e.album) and std.ascii.eqlIgnoreCase(have.artist, e.artist)) {
@@ -361,10 +484,16 @@ pub fn artistsMatching(
     query: []const u8,
     max: usize,
 ) ![][]const u8 {
+    var q: Query = .{};
+    q.init(query);
+    var fo: Folded = .{};
     var out: std.ArrayList([]const u8) = .empty;
     for (entries) |e| {
         if (out.items.len >= max) break;
-        if (query.len > 0 and !containsIgnoreCase(e.artist, query)) continue;
+        if (q.len > 0) {
+            fo.of(.{ e.artist, "", "" });
+            if (queryScore(&q, fo.f[0..1], false) == null) continue;
+        }
         try appendUnique(arena, &out, e.artist);
     }
     std.mem.sort([]const u8, out.items, {}, lessCaseless);
@@ -400,7 +529,7 @@ test "isAudio matches by extension, case-insensitively, and rejects the rest" {
     try testing.expect(!isAudio("a.verylongextension"));
 }
 
-test "roots splits on colons and expands a leading tilde" {
+test "roots splits on the path delimiter and expands a leading tilde" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -408,7 +537,8 @@ test "roots splits on colons and expands a leading tilde" {
     var env: std.process.Environ.Map = .init(a);
     try env.put("HOME", "/home/u");
 
-    const got = try roots(a, &env, "~/Music: /mnt/media ::/x");
+    const d = [_]u8{std.fs.path.delimiter};
+    const got = try roots(a, &env, "~/Music" ++ d ++ " /mnt/media " ++ d ++ d ++ "/x");
     try testing.expectEqual(@as(usize, 3), got.len);
     try testing.expectEqualStrings("/home/u/Music", got[0]);
     try testing.expectEqualStrings("/mnt/media", got[1]);
@@ -641,4 +771,40 @@ test "albumsMatching and artistsMatching dedupe and honor an empty query" {
     try testing.expectEqualStrings("Aphex Twin", artists[0]);
     try testing.expectEqual(@as(usize, 1), (try artistsMatching(a, &entries, "aphex", 10)).len);
     try testing.expectEqual(@as(usize, 0), (try artistsMatching(a, &entries, "zzz", 10)).len);
+}
+
+test "search: words across fields, accents, typos as a last resort, albums in order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lib = [_]Entry{
+        .{ .path = "/m/3", .title = "Knife Prty", .artist = "Deftones", .album = "White Pony", .track_no = 3 },
+        .{ .path = "/m/1", .title = "Feiticeira", .artist = "Deftones", .album = "White Pony", .track_no = 1 },
+        .{ .path = "/m/9", .title = "Rosemary", .artist = "Deftones", .album = "Diamond Eyes", .track_no = 9 },
+        .{ .path = "/m/x", .title = "Halo", .artist = "Beyoncé", .album = "I Am... Sasha Fierce", .track_no = 2 },
+        .{ .path = "/m/y", .title = "White Pony", .artist = "Someone", .album = "Covers", .track_no = 1 },
+    };
+
+    const combo = try search(a, &lib, "deftones rose", 10);
+    try testing.expectEqual(@as(usize, 1), combo.len);
+    try testing.expectEqualStrings("/m/9", combo[0].path);
+
+    const album = try search(a, &lib, "white pony", 10);
+    try testing.expectEqual(@as(usize, 3), album.len);
+    try testing.expectEqualStrings("/m/y", album[0].path);
+    try testing.expectEqualStrings("/m/1", album[1].path);
+    try testing.expectEqualStrings("/m/3", album[2].path);
+
+    const accent = try search(a, &lib, "beyonce", 10);
+    try testing.expectEqual(@as(usize, 1), accent.len);
+
+    const typo = try search(a, &lib, "rosmary", 10);
+    try testing.expectEqual(@as(usize, 1), typo.len);
+    try testing.expectEqualStrings("/m/9", typo[0].path);
+
+    const exact_wins = try search(a, &lib, "prty", 10);
+    try testing.expectEqual(@as(usize, 1), exact_wins.len);
+
+    try testing.expectEqual(@as(usize, 0), (try search(a, &lib, "zzzz qqqq", 10)).len);
+    try testing.expectEqual(@as(usize, 0), (try search(a, &lib, " ", 10)).len);
 }

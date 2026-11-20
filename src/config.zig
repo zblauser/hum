@@ -5,7 +5,7 @@ pub fn path(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8
     return fsutil.xdgPath(arena, env, "XDG_CONFIG_HOME", ".config", "config");
 }
 
-pub const Key = enum { theme, volume, scope, splash, music_dir, visualizer, mouse };
+pub const Key = enum { theme, volume, scope, filter, splash, music_dir, visualizer, mouse, gapless, replaygain, autoplay };
 
 pub fn loadKey(arena: std.mem.Allocator, file_path: []const u8, key: Key) ?[]const u8 {
     const bytes = fsutil.readFileAlloc(arena, file_path) orelse return null;

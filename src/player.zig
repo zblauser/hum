@@ -12,13 +12,50 @@ pub const Error = error{
 
 pub const Event = enum { none, end_file, file_error, started, audio_ready, idle, shutdown };
 
+pub const BANDS = 16;
+
+const VIS_AF = blk: {
+    var split: []const u8 = "";
+    var chains: []const u8 = "";
+    var merge: []const u8 = "[o]";
+    for (0..BANDS) |i| {
+        const f = 45.0 * @exp2(@as(f64, @floatFromInt(i)) / 2.0);
+        const bp = std.fmt.comptimePrint("bandpass=f={d:.0}:width_type=o:w=0.5", .{f});
+        split = split ++ std.fmt.comptimePrint("[s{d}]", .{i});
+        chains = chains ++ std.fmt.comptimePrint("[s{d}]{s},{s}[b{d}];", .{ i, bp, bp, i });
+        merge = merge ++ std.fmt.comptimePrint("[b{d}]", .{i});
+    }
+    const graph = "aformat=channel_layouts=stereo,asplit=2[o][m];[m]pan=mono|c0=0.5*c0+0.5*c1,asplit=" ++
+        std.fmt.comptimePrint("{d}", .{BANDS}) ++ split ++ ";" ++ chains ++ merge ++
+        std.fmt.comptimePrint("amerge=inputs={d}", .{BANDS + 1}) ++
+        ",astats=metadata=1:reset=1:length=0.05:measure_perchannel=RMS_level+Zero_crossings_rate:measure_overall=none,pan=stereo|c0=c0|c1=c1";
+    break :blk std.fmt.comptimePrint("@vis:lavfi=%{d}%{s}", .{ graph.len, graph });
+};
+
+const BASIC_AF = "@vis:lavfi=[astats=metadata=1:reset=1:length=0.05]";
+
+fn spectrumReady(version: []const u8) bool {
+    if (std.mem.startsWith(u8, version, "N-")) return true;
+    var it = std.mem.tokenizeAny(u8, std.mem.trimStart(u8, version, "n"), ".-~+ ");
+    const major = std.fmt.parseInt(u32, it.next() orelse return false, 10) catch return false;
+    const minor = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+    return major > 4 or (major == 4 and minor >= 4);
+}
+
+test "the spectrum graph needs ffmpeg 4.4 or a git build" {
+    for ([_][]const u8{ "6.1.1", "n7.0", "4.4.2-0ubuntu0.22.04.1", "N-112345-gdeadbeef", "8.0" }) |v| try std.testing.expect(spectrumReady(v));
+    for ([_][]const u8{ "4.3.6-0+deb11u1", "n4.2", "3.4.11", "", "git-2020" }) |v| try std.testing.expect(!spectrumReady(v));
+}
+
 pub const Player = struct {
     m: *const mpv.Api,
     handle: *mpv.Handle,
     has_track: bool = false,
     last_error: []const u8 = "",
 
-    pub fn init() Error!Player {
+    pub const Options = struct { gapless: bool = true, replaygain: [:0]const u8 = "no" };
+
+    pub fn init(opts: Options) Error!Player {
         const m = try mpv.load();
         const h = m.create() orelse return error.MpvCreate;
         _ = m.set_option_string(h, "video", "no");
@@ -33,12 +70,18 @@ pub const Player = struct {
         var plugin_buf: [512]u8 = undefined;
         if (mpv.mprisPlugin(&plugin_buf)) |plugin| _ = m.set_option_string(h, "scripts", plugin);
 
-        _ = m.set_option_string(h, "af", "@vis:lavfi=[astats=metadata=1:reset=1:length=0.05]");
         _ = m.set_option_string(h, "volume-max", "100");
+        _ = m.set_option_string(h, "gapless-audio", if (opts.gapless) "weak" else "no");
+        _ = m.set_option_string(h, "prefetch-playlist", if (opts.gapless) "yes" else "no");
+        _ = m.set_option_string(h, "replaygain", opts.replaygain);
         if (m.initialize(h) < 0) {
             m.terminate_destroy(h);
             return error.MpvInit;
         }
+        var ver: ?[*:0]u8 = null;
+        const known = m.get_property(h, "ffmpeg-version", mpv.FORMAT_STRING, @ptrCast(&ver)) >= 0 and ver != null;
+        defer if (known) m.free(ver.?);
+        _ = m.set_property_string(h, "af", if (known and spectrumReady(std.mem.span(ver.?))) VIS_AF else BASIC_AF);
         return .{ .m = m, .handle = h };
     }
 
@@ -47,14 +90,31 @@ pub const Player = struct {
     }
 
     pub fn loadUrl(self: *Player, alloc: std.mem.Allocator, url: []const u8, title: []const u8) !void {
-        const url_z = try alloc.dupeSentinel(u8, url, 0);
-        defer alloc.free(url_z);
+        try self.setTitle(alloc, title);
+        try self.loadfile(alloc, url, "replace");
+        self.has_track = true;
+    }
+
+    pub fn appendUrl(self: *Player, alloc: std.mem.Allocator, url: []const u8) !void {
+        try self.loadfile(alloc, url, "append");
+    }
+
+    pub fn dropUpcoming(self: *Player) void {
+        const argv = [_:null]?[*:0]const u8{"playlist-clear"};
+        _ = self.m.command(self.handle, &argv);
+    }
+
+    pub fn setTitle(self: *Player, alloc: std.mem.Allocator, title: []const u8) !void {
         const title_z = try alloc.dupeSentinel(u8, title, 0);
         defer alloc.free(title_z);
         _ = self.m.set_property_string(self.handle, "force-media-title", title_z);
-        const argv = [_:null]?[*:0]const u8{ "loadfile", url_z.ptr, "replace" };
+    }
+
+    fn loadfile(self: *Player, alloc: std.mem.Allocator, url: []const u8, how: [*:0]const u8) !void {
+        const url_z = try alloc.dupeSentinel(u8, url, 0);
+        defer alloc.free(url_z);
+        const argv = [_:null]?[*:0]const u8{ "loadfile", url_z.ptr, how };
         if (self.m.command(self.handle, &argv) < 0) return error.MpvLoad;
-        self.has_track = true;
     }
 
     pub fn stop(self: *Player) void {
@@ -128,28 +188,28 @@ pub const Player = struct {
         return std.math.clamp(v, 0, 100);
     }
 
-    pub fn rmsLevel(self: *Player) f64 {
-        const db = self.stat("Overall.RMS_level") orelse return 0;
-        return std.math.pow(f64, 10.0, std.math.clamp(db, -60.0, 0.0) / 20.0);
-    }
-
-    pub const Levels = struct { level: f32, left: f32, right: f32, bright: f32 };
+    pub const Levels = struct { level: f32 = 0, left: f32 = 0, right: f32 = 0, bright: f32 = 0, bands: [BANDS]f32 = @splat(0) };
 
     pub fn levels(self: *Player) Levels {
-        const overall = self.stat("Overall.RMS_level") orelse return .{ .level = 0, .left = 0, .right = 0, .bright = 0 };
-        const left = self.stat("1.RMS_level") orelse overall;
+        const left = self.stat("1.RMS_level") orelse return .{};
         const right = self.stat("2.RMS_level") orelse left;
         const zcr = self.stat("1.Zero_crossings_rate") orelse 0;
-        return .{
-            .level = dbNorm(overall),
-            .left = dbNorm(left),
-            .right = dbNorm(right),
+        const power = (std.math.pow(f64, 10, left / 10) + std.math.pow(f64, 10, right / 10)) / 2;
+        var out: Levels = .{
+            .level = dbNorm(10 * @log10(@max(power, 1e-12)), 50, 40),
+            .left = dbNorm(left, 50, 40),
+            .right = dbNorm(right, 50, 40),
             .bright = @floatCast(std.math.clamp(@sqrt(@max(zcr, 0) / 0.15), 0, 1)),
         };
+        inline for (0..BANDS) |i| {
+            const db = self.stat(std.fmt.comptimePrint("{d}.RMS_level", .{i + 3})) orelse -120;
+            out.bands[i] = dbNorm(db + @as(f64, @floatFromInt(i)) * 0.8, 44, 34);
+        }
+        return out;
     }
 
-    fn dbNorm(db: f64) f32 {
-        return @floatCast(std.math.clamp((db + 50.0) / 40.0, 0, 1));
+    fn dbNorm(db: f64, floor: f64, range: f64) f32 {
+        return @floatCast(std.math.clamp((db + floor) / range, 0, 1));
     }
 
     fn stat(self: *Player, comptime key: []const u8) ?f64 {

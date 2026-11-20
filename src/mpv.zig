@@ -55,13 +55,18 @@ const system_paths = switch (builtin.os.tag) {
         "/usr/local/lib/libmpv.2.dylib",
         "/opt/local/lib/libmpv.2.dylib",
     },
+    .windows => [_][:0]const u8{ "libmpv-2.dll", "mpv-2.dll", "mpv-1.dll" },
     else => [_][:0]const u8{ "libmpv.so.2", "libmpv.so.1", "/home/linuxbrew/.linuxbrew/lib/libmpv.so.2" },
 };
 
-const lib_name = if (builtin.os.tag == .macos) "libmpv.2.dylib" else "libmpv.so.2";
+const lib_name = switch (builtin.os.tag) {
+    .macos => "lib/libmpv.2.dylib",
+    .windows => "bin/libmpv-2.dll",
+    else => "lib/libmpv.so.2",
+};
 
 const prefix_path: [:0]const u8 = if (build_options.mpv_prefix.len > 0)
-    build_options.mpv_prefix ++ "/lib/" ++ lib_name
+    build_options.mpv_prefix ++ "/" ++ lib_name
 else
     "";
 
@@ -94,18 +99,53 @@ pub fn describe(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s} (api {d}.{d})", .{ path, v >> 16, v & 0xffff }) catch null;
 }
 
+const dl = if (builtin.os.tag == .windows) struct {
+    const Lib = *opaque {};
+    const MOD_NOT_FOUND = 126;
+    extern "kernel32" fn LoadLibraryA([*:0]const u8) callconv(.winapi) ?Lib;
+    extern "kernel32" fn GetProcAddress(Lib, [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn FreeLibrary(Lib) callconv(.winapi) c_int;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+
+    fn open(path: [:0]const u8) ?Lib {
+        return LoadLibraryA(path) orelse {
+            const e = GetLastError();
+            if (e != MOD_NOT_FOUND) note("{s}: windows error {d}", .{ path, e });
+            return null;
+        };
+    }
+    fn sym(lib: Lib, name: [:0]const u8) ?*anyopaque {
+        return GetProcAddress(lib, name);
+    }
+    fn close(lib: Lib) void {
+        _ = FreeLibrary(lib);
+    }
+} else struct {
+    const Lib = *anyopaque;
+
+    fn open(path: [:0]const u8) ?Lib {
+        return std.c.dlopen(path, .{ .LAZY = true, .GLOBAL = true }) orelse {
+            const msg = std.mem.span(std.c.dlerror() orelse return null);
+            if (std.ascii.findIgnoreCase(msg, "no such file") == null) note("{s}", .{msg});
+            return null;
+        };
+    }
+    fn sym(lib: Lib, name: [:0]const u8) ?*anyopaque {
+        return std.c.dlsym(lib, name);
+    }
+    fn close(lib: Lib) void {
+        _ = std.c.dlclose(lib);
+    }
+};
+
 fn tryOpen(path: [:0]const u8) ?Api {
-    const lib = std.c.dlopen(path, .{ .LAZY = true, .GLOBAL = true }) orelse {
-        const msg = std.mem.span(std.c.dlerror() orelse return null);
-        if (std.ascii.findIgnoreCase(msg, "no such file") == null) note("{s}", .{msg});
-        return null;
-    };
+    const lib = dl.open(path) orelse return null;
     var out: Api = undefined;
     const info = @typeInfo(Api).@"struct";
     inline for (info.field_names) |name| {
-        const sym = std.c.dlsym(lib, "mpv_" ++ name) orelse {
+        const sym = dl.sym(lib, "mpv_" ++ name) orelse {
             note("{s}: no mpv_{s}", .{ path, name });
-            _ = std.c.dlclose(lib);
+            dl.close(lib);
             return null;
         };
         @field(out, name) = @ptrCast(@alignCast(sym));
@@ -113,14 +153,14 @@ fn tryOpen(path: [:0]const u8) ?Api {
     const major = out.client_api_version() >> 16;
     if (major < 1 or major > 2) {
         note("{s}: client api {d} unsupported", .{ path, major });
-        _ = std.c.dlclose(lib);
+        dl.close(lib);
         return null;
     }
     return out;
 }
 
 pub fn mprisPlugin(buf: []u8) ?[:0]const u8 {
-    if (builtin.os.tag == .macos) return null;
+    if (builtin.os.tag == .macos or builtin.os.tag == .windows) return null;
     const system = [_][:0]const u8{
         "/etc/mpv/scripts/mpris.so",
         "/usr/lib/mpv-mpris/mpris.so",

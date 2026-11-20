@@ -14,4 +14,6 @@ test {
     _ = @import("feed.zig");
     _ = @import("stream.zig");
     _ = @import("vis.zig");
+    _ = @import("art.zig");
+    _ = @import("job.zig");
 }

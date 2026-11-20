@@ -1,6 +1,7 @@
 const std = @import("std");
 const proc = @import("proc.zig");
 const track_mod = @import("track.zig");
+const job = @import("job.zig");
 const RESOLVE_TIMEOUT_S = "15";
 
 pub const Error = error{ NoVideoId, NoUri } || proc.Error || std.mem.Allocator.Error;
@@ -19,16 +20,46 @@ pub fn resolveAudioUrl(gpa: std.mem.Allocator, io: std.Io, video_id: []const u8)
     if (video_id.len == 0) return error.NoVideoId;
 
     const out = try proc.runCapture(gpa, io, &.{
-        "yt-dlp",        "-f",               "bestaudio",
-        "--no-warnings", "--socket-timeout", RESOLVE_TIMEOUT_S,
-        "-g",            "--",               video_id,
+        "yt-dlp",        "-f",                 "bestaudio",
+        "--no-warnings", "--socket-timeout",   RESOLVE_TIMEOUT_S,
+        "-O",            "%(available_at|0)s", "-O",
+        "url",           "--",                 video_id,
     });
     defer gpa.free(out);
 
-    var url = std.mem.trim(u8, out, " \r\n\t");
-    if (std.mem.indexOfScalar(u8, url, '\n')) |nl| url = url[0..nl];
+    const r = parseResolved(out);
+    if (r.url.len == 0) return error.ProcFailed;
+    const wait = waitMs(r.available_at, @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms)));
+    if (wait > 0) std.Io.sleep(io, .fromMilliseconds(wait), .real) catch {};
+    return gpa.dupe(u8, r.url);
+}
 
-    return gpa.dupe(u8, url);
+pub const Prefetch = job.Job(resolveAny);
+
+fn resolveAny(gpa: std.mem.Allocator, io: std.Io, t: track_mod.Track) anyerror![]u8 {
+    return resolve(gpa, io, t);
+}
+
+const Resolved = struct { url: []const u8 = "", available_at: i64 = 0 };
+
+fn parseResolved(out: []const u8) Resolved {
+    var r: Resolved = .{};
+    var it = std.mem.tokenizeAny(u8, out, "\r\n");
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (std.mem.startsWith(u8, line, "http")) {
+            if (r.url.len == 0) r.url = line;
+        } else if (std.fmt.parseInt(i64, line, 10)) |v| r.available_at = v else |_| {}
+    }
+    return r;
+}
+
+const MAX_WAIT_MS = 10_000;
+const WAIT_SLACK_MS = 1000;
+
+fn waitMs(available_at_s: i64, now_ms: i64) i64 {
+    if (available_at_s <= 0) return 0;
+    return std.math.clamp(available_at_s * 1000 + WAIT_SLACK_MS - now_ms, 0, MAX_WAIT_MS);
 }
 
 pub const STALE_DAYS = 60;
@@ -67,6 +98,26 @@ test "yt-dlp age is counted in days from its date version" {
     try testing.expectEqual(@as(?u32, null), ytdlpAgeDays("garbage", oct_5_2026));
     try testing.expectEqual(@as(?u32, null), ytdlpAgeDays("2026.13.01", oct_5_2026));
     try testing.expectEqual(@as(?u32, null), ytdlpAgeDays("2026.10", oct_5_2026));
+}
+
+test "yt-dlp output yields the url and when it becomes fetchable" {
+    const r = parseResolved("1794852665\nhttps://rr1.googlevideo.com/videoplayback?x=1\n");
+    try testing.expectEqualStrings("https://rr1.googlevideo.com/videoplayback?x=1", r.url);
+    try testing.expectEqual(@as(i64, 1794852665), r.available_at);
+
+    const legacy = parseResolved("NA\r\nhttps://a/b\r\nhttps://c/d\n");
+    try testing.expectEqualStrings("https://a/b", legacy.url);
+    try testing.expectEqual(@as(i64, 0), legacy.available_at);
+
+    try testing.expectEqualStrings("", parseResolved("").url);
+    try testing.expectEqualStrings("", parseResolved("0\n").url);
+}
+
+test "playback waits for available_at, never forever" {
+    try testing.expectEqual(@as(i64, 0), waitMs(0, 5_000));
+    try testing.expectEqual(@as(i64, 3_000), waitMs(10, 8_000));
+    try testing.expectEqual(@as(i64, 0), waitMs(10, 20_000));
+    try testing.expectEqual(@as(i64, MAX_WAIT_MS), waitMs(1_000, 0));
 }
 
 test "resolve hands back local paths and URLs without a subprocess" {

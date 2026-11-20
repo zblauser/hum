@@ -31,3 +31,30 @@ jobs:
           zig build
           ./zig-out/bin/hum doctor | tee doctor.txt
           grep -E '^  libmpv +libmpv\.so' doctor.txt
+
+  windows:
+    name: windows test + libmpv load
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: unit tests
+        run: zig build test
+
+      - name: libmpv runtime load
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zig build
+          gh release download --repo shinchiro/mpv-winbuild-cmake --pattern 'mpv-dev-x86_64-2*.7z' --output mpv-dev.7z
+          7z e mpv-dev.7z libmpv-2.dll -ozig-out/bin
+          ./zig-out/bin/hum.exe doctor | tee doctor.txt
+          grep -E '^  libmpv +libmpv-2\.dll' doctor.txt

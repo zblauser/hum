@@ -47,6 +47,62 @@ pub fn sanitizeDupe(arena: std.mem.Allocator, s: []const u8) ?[]const u8 {
     return sanitize(arena, s) catch null;
 }
 
+pub const FOLD_MAX = 256;
+
+pub fn fold(out: *[FOLD_MAX]u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    var gap = false;
+    var one: [1]u8 = undefined;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const raw = s[i..@min(i + len, s.len)];
+        const cp: u21 = std.unicode.utf8Decode(raw) catch s[i];
+        i += raw.len;
+        const piece: []const u8 = switch (cp) {
+            'A'...'Z' => blk: {
+                one[0] = @intCast(cp + 32);
+                break :blk &one;
+            },
+            'a'...'z', '0'...'9' => raw,
+            '\'', 0x2018, 0x2019, 0x2bc, 0x300...0x36f => continue,
+            '&' => "and",
+            0xc0...0x17f => latinBase(cp),
+            else => if (cp < 0x80 or (cp >= 0x2000 and cp <= 0x206f)) " " else raw,
+        };
+        if (piece[0] == ' ') {
+            gap = true;
+            continue;
+        }
+        const sep: usize = if ((gap or cp == '&') and n > 0) 1 else 0;
+        if (n + sep + piece.len > out.len) break;
+        if (sep == 1) out[n] = ' ';
+        @memcpy(out[n + sep .. n + sep + piece.len], piece);
+        n += sep + piece.len;
+        gap = cp == '&';
+    }
+    return out[0..n];
+}
+
+const latin1 = [_][]const u8{
+    "a", "a", "a", "a", "a", "a", "ae", "c", "e", "e", "e", "e", "i", "i", "i",  "i",
+    "d", "n", "o", "o", "o", "o", "o",  " ", "o", "u", "u", "u", "u", "y", "th", "ss",
+};
+
+const latin_ext = [_]struct { u21, []const u8 }{
+    .{ 0x105, "a" }, .{ 0x10d, "c" }, .{ 0x111, "d" },  .{ 0x11b, "e" },  .{ 0x123, "g" },
+    .{ 0x127, "h" }, .{ 0x131, "i" }, .{ 0x133, "ij" }, .{ 0x135, "j" },  .{ 0x138, "k" },
+    .{ 0x142, "l" }, .{ 0x14b, "n" }, .{ 0x151, "o" },  .{ 0x153, "oe" }, .{ 0x159, "r" },
+    .{ 0x161, "s" }, .{ 0x167, "t" }, .{ 0x173, "u" },  .{ 0x175, "w" },  .{ 0x178, "y" },
+    .{ 0x17e, "z" }, .{ 0x17f, "s" },
+};
+
+fn latinBase(cp: u21) []const u8 {
+    if (cp <= 0xff) return if (cp == 0xf7) " " else if (cp == 0xff) "y" else latin1[(cp - 0xc0) & 0x1f];
+    for (latin_ext) |r| if (cp <= r[0]) return r[1];
+    return " ";
+}
+
 const Range = struct { u21, u21 };
 
 const zero_ranges = [_]Range{
@@ -105,4 +161,17 @@ test "sanitize drops bidi overrides so a title cannot reorder its row" {
     defer arena.deinit();
     const got = try sanitize(arena.allocator(), "song\u{202e}3pm.exe\u{2066}x\u{2069}");
     try std.testing.expectEqualStrings("song3pm.exex", got);
+}
+
+test "fold lowercases, strips accents and apostrophes, spells out &" {
+    var buf: [FOLD_MAX]u8 = undefined;
+    try std.testing.expectEqualStrings("beyonce", fold(&buf, "Beyoncé"));
+    try std.testing.expectEqualStrings("beyonce", fold(&buf, "Beyonce\u{301}"));
+    try std.testing.expectEqualStrings("dont stop me now", fold(&buf, "Don’t Stop Me—Now!"));
+    try std.testing.expectEqualStrings("simon and garfunkel", fold(&buf, "Simon & Garfunkel"));
+    try std.testing.expectEqualStrings("simon and garfunkel", fold(&buf, "Simon&Garfunkel"));
+    try std.testing.expectEqualStrings("sigur ros agaetis byrjun", fold(&buf, "Sigur Rós – Ágætis byrjun"));
+    try std.testing.expectEqualStrings("motorhead lodz", fold(&buf, "  Motörhead (Łódź)  "));
+    try std.testing.expectEqualStrings("坂本龍一", fold(&buf, "坂本龍一"));
+    try std.testing.expectEqualStrings("", fold(&buf, " - "));
 }

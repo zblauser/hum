@@ -30,7 +30,8 @@ jobs:
           done
           mkdir -p out/macos-universal/bin
           lipo -create -output out/macos-universal/bin/hum out/aarch64-macos/bin/hum out/x86_64-macos/bin/hum
-          file out/*/bin/hum
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix out/x86_64-windows-gnu
+          file out/*/bin/hum out/x86_64-windows-gnu/bin/hum.exe
 
       - name: package
         run: |
@@ -40,7 +41,10 @@ jobs:
           pack linux-x86_64 x86_64-linux-gnu
           pack linux-arm64 aarch64-linux-gnu
           pack freebsd-x86_64 x86_64-freebsd
+          (cd out/x86_64-windows-gnu/bin && zip -9 ../../../hum-windows-x86_64.zip hum.exe)
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: hum-*.tar.gz
+          files: |
+            hum-*.tar.gz
+            hum-windows-x86_64.zip

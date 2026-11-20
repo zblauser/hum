@@ -8,6 +8,7 @@ zig-pkg/
 *.o
 *.dSYM/
 assets/*.tape
+assets/*.gif
 
 # os/editor
 *.DS_Store

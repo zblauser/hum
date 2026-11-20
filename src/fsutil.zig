@@ -1,4 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const windows = builtin.os.tag == .windows;
 
 pub const c = struct {
     pub const FILE = std.c.FILE;
@@ -6,8 +9,6 @@ pub const c = struct {
     pub const fclose = std.c.fclose;
     pub const fread = std.c.fread;
     pub const fwrite = std.c.fwrite;
-    pub const write = std.c.write;
-    pub const close = std.c.close;
     pub const unlink = std.c.unlink;
     pub const rmdir = std.c.rmdir;
     pub const access = std.c.access;
@@ -16,15 +17,18 @@ pub const c = struct {
 
     pub extern "c" fn fseek(stream: *FILE, offset: c_long, whence: c_int) c_int;
     pub extern "c" fn ftell(stream: *FILE) c_long;
-    pub extern "c" fn mkstemp(template: [*:0]u8) c_int;
-    pub extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
-    pub extern "c" fn usleep(usec: c_uint) c_int;
+    extern "c" fn mkstemp(template: [*:0]u8) c_int;
+    extern "c" fn _mkdir(path: [*:0]const u8) c_int;
+    extern "kernel32" fn GetTempPathA(len: u32, buf: [*]u8) callconv(.winapi) u32;
+    extern "kernel32" fn GetTempFileNameA(dir: [*:0]const u8, prefix: [*:0]const u8, unique: u32, out: [*]u8) callconv(.winapi) u32;
+
+    fn mkdir(path: [*:0]const u8) c_int {
+        return if (windows) _mkdir(path) else std.c.mkdir(path, 0o755);
+    }
 
     pub const SEEK_SET: c_int = 0;
     pub const SEEK_END: c_int = 2;
     pub const F_OK: c_uint = 0;
-    pub const EPIPE: c_int = @backingInt(std.c.E.PIPE);
-    pub const EEXIST: c_int = @backingInt(std.c.E.EXIST);
 };
 
 const READ_ALL_CAP: usize = 8 * 1024 * 1024;
@@ -64,17 +68,20 @@ pub fn xdgPath(
     fallback_dir: []const u8,
     file: []const u8,
 ) ![:0]const u8 {
+    const sep = std.fs.path.sep;
     const base: []const u8 = if (env.get(xdg_var)) |x|
         x
+    else if (windows)
+        env.get(if (std.mem.eql(u8, xdg_var, "XDG_CONFIG_HOME")) "APPDATA" else "LOCALAPPDATA") orelse return error.NoHome
     else blk: {
         const home = env.get("HOME") orelse return error.NoHome;
         break :blk try std.fmt.allocPrint(arena, "{s}/{s}", .{ home, fallback_dir });
     };
 
-    const current = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}", .{ base, APP_DIR, file }, 0);
+    const current = try std.fmt.allocPrintSentinel(arena, "{s}{c}{s}{c}{s}", .{ base, sep, APP_DIR, sep, file }, 0);
     if (exists(current)) return current;
 
-    const legacy = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/{s}", .{ base, LEGACY_DIR, file }, 0);
+    const legacy = try std.fmt.allocPrintSentinel(arena, "{s}{c}{s}{c}{s}", .{ base, sep, LEGACY_DIR, sep, file }, 0);
     if (exists(legacy)) return legacy;
 
     return current;
@@ -98,36 +105,46 @@ pub fn appendFile(arena: std.mem.Allocator, file_path: []const u8, bytes: []cons
 }
 
 pub fn makeTemp(arena: std.mem.Allocator, prefix: []const u8, contents: []const u8) ![:0]u8 {
-    const path = try std.fmt.allocPrintSentinel(arena, "/tmp/{s}XXXXXX", .{prefix}, 0);
-    const fd = c.mkstemp(path.ptr);
-    if (fd < 0) return error.TempFileOpen;
-    defer _ = c.close(fd);
-    var off: usize = 0;
-    while (off < contents.len) {
-        const n = c.write(fd, contents[off..].ptr, contents.len - off);
-        if (n <= 0) return error.TempFileWrite;
-        off += @intCast(n);
-    }
+    const path = if (windows) blk: {
+        var dir: [261:0]u8 = undefined;
+        const n = c.GetTempPathA(dir.len, &dir);
+        if (n == 0 or n >= dir.len) return error.TempFileOpen;
+        dir[n] = 0;
+        const pre = try arena.dupeSentinel(u8, prefix, 0);
+        var out: [261]u8 = undefined;
+        if (c.GetTempFileNameA(&dir, pre.ptr, 0, &out) == 0) return error.TempFileOpen;
+        break :blk try arena.dupeSentinel(u8, std.mem.sliceTo(&out, 0), 0);
+    } else blk: {
+        const p = try std.fmt.allocPrintSentinel(arena, "/tmp/{s}XXXXXX", .{prefix}, 0);
+        const fd = c.mkstemp(p.ptr);
+        if (fd < 0) return error.TempFileOpen;
+        _ = std.c.close(fd);
+        break :blk p;
+    };
+    errdefer _ = c.unlink(path.ptr);
+    writeFile(arena, path, contents) catch return error.TempFileWrite;
     return path;
+}
+
+fn isSep(b: u8) bool {
+    return b == '/' or (windows and b == '\\');
 }
 
 pub fn makePathZ(arena: std.mem.Allocator, dir: []const u8) !void {
     var i: usize = 0;
     while (i < dir.len) {
-        while (i < dir.len and dir[i] == '/') : (i += 1) {}
+        while (i < dir.len and isSep(dir[i])) : (i += 1) {}
         const start = i;
-        while (i < dir.len and dir[i] != '/') : (i += 1) {}
+        while (i < dir.len and !isSep(dir[i])) : (i += 1) {}
         if (i == start) break;
         const partial = try arena.dupeSentinel(u8, dir[0..i], 0);
-        const r = std.c.mkdir(partial.ptr, 0o755);
-        if (r != 0) {
-            const e = std.c._errno().*;
-            if (e != c.EEXIST) return error.MkdirFailed;
-        }
+        if (exists(partial)) continue;
+        if (c.mkdir(partial.ptr) != 0 and !exists(partial)) return error.MkdirFailed;
     }
 }
 
 const testing = std.testing;
+const S = std.fs.path.sep_str;
 
 test "readFileAlloc round-trips contents; null on empty or missing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -152,8 +169,9 @@ test "makePathZ creates nested dirs and is idempotent" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const base = try a.dupeSentinel(u8, "/tmp/hum_mp_XXXXXX", 0);
-    try testing.expect(c.mkdtemp(base.ptr) != null);
+    const base = try makeTemp(a, "hum_mp_", "");
+    _ = c.unlink(base.ptr);
+    try makePathZ(a, base);
 
     const mid = try std.fmt.allocPrintSentinel(a, "{s}/a", .{base}, 0);
     const nested = try std.fmt.allocPrintSentinel(a, "{s}/a/b", .{base}, 0);
@@ -177,13 +195,14 @@ test "xdgPath prefers the new dir, falls back to the pre-rename one" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const base = try a.dupeSentinel(u8, "/tmp/hum_xdg_XXXXXX", 0);
-    try testing.expect(c.mkdtemp(base.ptr) != null);
+    const base = try makeTemp(a, "hum_xdg_", "");
+    _ = c.unlink(base.ptr);
+    try makePathZ(a, base);
 
-    const new_dir = try std.fmt.allocPrintSentinel(a, "{s}/hum", .{base}, 0);
-    const old_dir = try std.fmt.allocPrintSentinel(a, "{s}/ytcli", .{base}, 0);
-    const new_file = try std.fmt.allocPrintSentinel(a, "{s}/hum/history", .{base}, 0);
-    const old_file = try std.fmt.allocPrintSentinel(a, "{s}/ytcli/history", .{base}, 0);
+    const new_dir = try std.fmt.allocPrintSentinel(a, "{s}" ++ S ++ "hum", .{base}, 0);
+    const old_dir = try std.fmt.allocPrintSentinel(a, "{s}" ++ S ++ "ytcli", .{base}, 0);
+    const new_file = try std.fmt.allocPrintSentinel(a, "{s}" ++ S ++ "hum" ++ S ++ "history", .{base}, 0);
+    const old_file = try std.fmt.allocPrintSentinel(a, "{s}" ++ S ++ "ytcli" ++ S ++ "history", .{base}, 0);
     defer {
         _ = c.unlink(new_file.ptr);
         _ = c.unlink(old_file.ptr);
@@ -210,8 +229,15 @@ test "xdgPath falls back to HOME and still honors the legacy dir" {
     const a = arena.allocator();
 
     var env: std.process.Environ.Map = .init(a);
-    try env.put("HOME", "/home/u");
-    try testing.expectEqualStrings("/home/u/.config/hum/config", try xdgPath(a, &env, "XDG_CONFIG_HOME", ".config", "config"));
+    if (windows) {
+        try env.put("APPDATA", "C:\\r");
+        try env.put("LOCALAPPDATA", "C:\\l");
+        try testing.expectEqualStrings("C:\\r\\hum\\config", try xdgPath(a, &env, "XDG_CONFIG_HOME", ".config", "config"));
+        try testing.expectEqualStrings("C:\\l\\hum\\log", try xdgPath(a, &env, "XDG_DATA_HOME", ".local/share", "log"));
+    } else {
+        try env.put("HOME", "/home/u");
+        try testing.expectEqualStrings("/home/u/.config/hum/config", try xdgPath(a, &env, "XDG_CONFIG_HOME", ".config", "config"));
+    }
 
     var empty: std.process.Environ.Map = .init(a);
     try testing.expectError(error.NoHome, xdgPath(a, &empty, "XDG_DATA_HOME", ".local/share", "log"));

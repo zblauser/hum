@@ -14,9 +14,11 @@ const feed = @import("feed.zig");
 const log = @import("log.zig");
 const mpv = @import("mpv.zig");
 
+const term = @import("term.zig");
 const c = @import("fsutil.zig").c;
 
 fn restoreDefaultSignals() void {
+    if (term.windows) return;
     const default: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(std.posix.SIG.INT, &default, null);
     std.posix.sigaction(std.posix.SIG.TERM, &default, null);
@@ -28,20 +30,17 @@ fn printOut(comptime fmt: []const u8, args: anytype) !void {
 }
 
 fn putStdout(bytes: []const u8) !void {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const n = c.write(1, bytes[i..].ptr, bytes.len - i);
-        if (n < 0) {
-            if (std.c._errno().* == c.EPIPE) std.process.exit(0);
-            return error.WriteFailed;
-        }
-        if (n == 0) return error.WriteFailed;
-        i += @intCast(n);
-    }
+    term.writeAll(bytes) catch |err| {
+        if (err == error.BrokenPipe) std.process.exit(0);
+        return err;
+    };
 }
 
 pub const VERSION = @import("build_options").version;
-pub const MPV_HINT = "nothing can play; install mpv (brew install mpv, apt install libmpv2)";
+pub const MPV_HINT = if (term.windows)
+    "nothing can play; put libmpv-2.dll (from an mpv-dev build) next to hum.exe or on PATH"
+else
+    "nothing can play; install mpv (brew install mpv, apt install libmpv2)";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -49,6 +48,8 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     log.init(arena, init.environ_map);
+    const cp = term.utf8Output();
+    defer term.restoreOutput(cp);
 
     const raw_args = try init.minimal.args.toSlice(arena);
 
@@ -156,7 +157,7 @@ fn joinArgs(arena: std.mem.Allocator, words: []const [:0]const u8) ![]u8 {
 }
 
 fn printHelp() !void {
-    var buf: [1024]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const text = std.fmt.bufPrint(&buf,
         \\hum — terminal media player (local files + YouTube Music)
         \\
@@ -169,8 +170,8 @@ fn printHelp() !void {
         \\  hum playlists [name]   list saved playlists, or one playlist's tracks
         \\  hum library [scan]     list the local library (scan re-reads tags)
         \\  hum library dir <path> set the music folder (colon-separated for several)
-        \\  hum feeds [name]         podcast subscriptions (add <url> / remove <url>)
-        \\  hum doctor               paths, settings and dependencies at a glance
+        \\  hum feeds [name]       podcast subscriptions (add <url> / remove <url>)
+        \\  hum doctor             paths, settings and dependencies at a glance
         \\  hum -h, --help         this message
         \\  hum -v, --version      print version
         \\
@@ -195,7 +196,7 @@ fn cmdPlay(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, words: 
     const audio_url = try stream.resolve(gpa, io, t);
     defer gpa.free(audio_url);
 
-    var p = player.Player.init() catch |err| {
+    var p = player.Player.init(.{}) catch |err| {
         if (err != error.MpvMissing) return err;
         std.debug.print("libmpv not found: {s}\n", .{MPV_HINT});
         std.process.exit(1);
@@ -207,7 +208,7 @@ fn cmdPlay(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, words: 
         switch (ev) {
             .end_file, .shutdown => return,
             .audio_ready => restoreDefaultSignals(),
-            else => _ = c.usleep(50_000),
+            else => std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {},
         }
     }
 }
@@ -434,6 +435,11 @@ fn cmdDoctor(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, env: 
             try printOut("  {s: <14} MISSING — youtube search and playback will fail\n", .{exe});
         }
     }
+    if (onPath(arena, env, "ffmpeg")) |full| {
+        try printOut("  {s: <14} {s}\n", .{ "ffmpeg", full });
+    } else {
+        try printOut("  {s: <14} not found — optional, only the cover visualizer uses it\n", .{"ffmpeg"});
+    }
     if (stream.ytdlpVersion(gpa, io)) |ver| {
         defer gpa.free(ver);
         const v = std.mem.trim(u8, ver, " \r\n\t");
@@ -459,12 +465,12 @@ fn exists(arena: std.mem.Allocator, path: []const u8) bool {
 
 fn onPath(arena: std.mem.Allocator, env: *std.process.Environ.Map, name: []const u8) ?[]const u8 {
     const path_env = env.get("PATH") orelse return null;
-    var it = std.mem.splitScalar(u8, path_env, ':');
+    var it = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const full = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name }) catch continue;
+        const full = std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ dir, name, if (term.windows) ".exe" else "" }) catch continue;
         const z = arena.dupeSentinel(u8, full, 0) catch continue;
-        if (c.access(z.ptr, 1) == 0) return full;
+        if (c.access(z.ptr, if (term.windows) 0 else 1) == 0) return full;
     }
     return null;
 }
