@@ -25,7 +25,7 @@ jobs:
       - name: build
         run: |
           set -e
-          for t in aarch64-macos x86_64-macos x86_64-linux-gnu aarch64-linux-gnu x86_64-freebsd; do
+          for t in aarch64-macos x86_64-macos x86_64-linux-gnu aarch64-linux-gnu x86-linux-musl arm-linux-gnueabihf x86_64-freebsd; do
             zig build -Doptimize=ReleaseSafe -Dtarget=$t --prefix out/$t
           done
           mkdir -p out/macos-universal/bin
@@ -40,6 +40,8 @@ jobs:
           pack macos-universal macos-universal
           pack linux-x86_64 x86_64-linux-gnu
           pack linux-arm64 aarch64-linux-gnu
+          pack linux-x86-musl x86-linux-musl
+          pack linux-armv7 arm-linux-gnueabihf
           pack freebsd-x86_64 x86_64-freebsd
           (cd out/x86_64-windows-gnu/bin && zip -9 ../../../hum-windows-x86_64.zip hum.exe)
 

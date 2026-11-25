@@ -901,7 +901,7 @@ fn cover(cv: *Canvas, m: *Motion, a: Audio, steps: usize, art: Art) void {
     const s = @min(w, h);
     if (@abs(m.glow - m.exposure) > 0.2) m.exposure = @round(m.glow * 4) / 4;
     const c: Cover = .{ .art = art, .ox = (w - s) / 2, .oy = (h - s) / 2, .s = s, .gain = 0.9 + 0.25 * m.exposure };
-    const key = std.hash.Wyhash.hash(cv.w << 32 | cv.h << 1 | 1, art.px) ^ @as(u32, @bitCast(c.gain));
+    const key = std.hash.Wyhash.hash(@as(u64, cv.w) << 32 | cv.h << 1 | 1, art.px) ^ @as(u32, @bitCast(c.gain));
     if (key != m.cover_key) {
         m.cover_key = key;
         sharpCover(cv, c);

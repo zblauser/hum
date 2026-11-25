@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "hum",
         .root_module = mod,
+        .linkage = if (target.result.abi.isMusl()) .dynamic else null,
         .win32_manifest = b.path("src/hum.manifest"),
     });
 
@@ -61,6 +62,8 @@ fn addCheckStep(b: *std.Build, options: *std.Build.Step.Options) void {
         "x86_64-freebsd",
         "x86_64-linux-gnu",
         "aarch64-linux-gnu",
+        "x86-linux-musl",
+        "arm-linux-gnueabihf",
         "x86_64-macos",
         "aarch64-macos",
         "x86_64-windows-gnu",

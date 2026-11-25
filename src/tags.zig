@@ -440,7 +440,7 @@ fn walkAtoms(arena: std.mem.Allocator, bytes: []const u8, tags: *Tags, depth: u8
         const start = c.i;
         var size: u64 = c.u32be() orelse return;
         const kind = c.take(4) orelse return;
-        var header: u64 = 8;
+        var header: usize = 8;
         if (size == 1) {
             size = c.u64be() orelse return;
             header = 16;

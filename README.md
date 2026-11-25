@@ -19,7 +19,16 @@ zig 0.17, single binary
 - outbound calls only: never listens on a socket
 
 ## version
-<b>v0.1.9</b> a real spectrum, dithered visualizers, and windows
+<b>v0.1.10</b> 32-bit linux, runs in iSH
+- **32-bit builds**: `linux-x86-musl` (alpine, and iSH on iPhone/iPad) and `linux-armv7` (raspberry pi os)
+- fix: two spots assumed 64-bit and broke 32-bit builds (mp4 tag reader, cover visualizer)
+- iSH has no audio device yet, so there it searches and browses but doesn't play
+
+<details>
+<summary>previous</summary><br>
+
+<b>v0.1.9</b><br>
+a real spectrum, dithered visualizers, and windows
 - **windows**: native x86_64 build. put `libmpv-2.dll` (from an mpv-dev build) next to `hum.exe` or on PATH, plus `yt-dlp`
 - **real spectrum**: mpv splits the audio into 16 bands, so `bars` follows the music by frequency now, and a bass-hit detector drives the pulses
 - **visualizers**, all dithered in your theme's colors: `cover` (the album art, now first; a track without art skips to the next one), `bars`, `hypercube`, `ellipses`, `ripple`, `plasma`, `orbit`, `halftone`, `rain`. `cube`/`rings` in your config still work
@@ -31,9 +40,6 @@ zig 0.17, single binary
 - **gapless** playback and `replaygain=track|album`
 - results drill in: artist → album → tracks, `show all` rows, `more results` loads the next page, `h`/`esc` goes back one level
 - scope and filter are remembered
-
-<details>
-<summary>previous</summary><br>
 
 <b>v0.1.8</b><br>
 visualizers, mouse, and installs anywhere mpv does
@@ -118,7 +124,7 @@ dropping out the `ytcli` name; it's a media player now and youtube is only one s
 ```sh
 brew install zblauser/tap/hum          # macOS / linuxbrew: prebuilt binary + mpv + yt-dlp, nothing to compile
 ```
-or grab a binary from [releases](../../releases): macOS (universal), Linux (arm64/x86_64), FreeBSD, Windows (x86_64).
+or grab a binary from [releases](../../releases): macOS (universal), Linux (arm64/x86_64, 32-bit x86/armv7), FreeBSD, Windows (x86_64).
 
 ## dependencies
 
